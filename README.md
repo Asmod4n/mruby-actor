@@ -1,3 +1,5 @@
+This is currenty broken, because i had to remove threading from my mruby-zmq gem, if someone can fix that code a PR is very appreciated.
+
 # mruby-actor
 Breaking changes
 ================
