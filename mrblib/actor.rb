@@ -1,7 +1,3 @@
-unless ZMQ.const_defined?("Poller")
-  fail NotImplementedError, "mruby-actor needs libzmq with poller support"
-end
-
 unless LibZMQ.has? "curve"
   fail NotImplementedError, "mruby-actor needs libzmq with curve support"
 end
@@ -93,7 +89,8 @@ class Actor < ZMQ::Thread
     MRE = "MRE\1".freeze
     N = 'n'.freeze
 
-    def setup
+    def initialize(options = {}, &block)
+      @options = options
       @interrupted = false
       @instances = {}
       @remote_clients = {}
@@ -163,7 +160,7 @@ class Actor < ZMQ::Thread
       end
     ensure
       @multicaster.send("#{MRE}#{@keypair[:public_key]}#{[0].pack(N)}#{@group}", 0, @multicast_address, 5670)
-      usleep(1)
+      usleep(16)
     end
 
     def multicast_timer(timer_id)
