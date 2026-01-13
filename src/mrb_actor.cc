@@ -28,13 +28,17 @@ MRB_END_DECL
 #include <mruby/hash.h>
 #include <mruby/variable.h>
 #include <mruby/num_helpers.hpp>
+#include <mruby/zmq.h>
+#include <mruby/proc.h>
+#include <mruby/class.h>
+#include <print>
 
 static void *mrb_actor_zmq_context = nullptr;
 static std::once_flag zmq_context_once;
 
 struct ZmqSocket
 {
-  mrb_state *mrb = nullptr;
+  mrb_state *mrb;
 
   explicit ZmqSocket(mrb_state *mrb, int type) : mrb(mrb)
   {
@@ -93,7 +97,7 @@ struct ZmqMessage
 {
   ZmqMessage(mrb_state *mrb) : mrb(mrb)
   {
-    if (unlikely(zmq_msg_init(&msg) != 0)) {
+    if (unlikely(zmq_msg_init(&_msg) != 0)) {
       errno = zmq_errno();
       mrb_sys_fail(mrb, "Failed to initialize ZMQ message");
     }
@@ -101,16 +105,16 @@ struct ZmqMessage
 
   explicit ZmqMessage(mrb_state *mrb, const void *string, size_t size) : mrb(mrb)
   {
-    if (unlikely(zmq_msg_init_size(&msg, size) != 0)) {
+    if (unlikely(zmq_msg_init_size(&_msg, size) != 0)) {
       errno = zmq_errno();
       mrb_sys_fail(mrb, "Failed to initialize ZMQ message with size");
     }
-    std::memcpy(zmq_msg_data(&msg), string, size);
+    std::memcpy(zmq_msg_data(&_msg), string, size);
   }
 
   ~ZmqMessage()
   {
-    zmq_msg_close(&msg);
+    zmq_msg_close(&_msg);
   }
 
   ZmqMessage(const ZmqMessage&) = delete;
@@ -120,28 +124,28 @@ struct ZmqMessage
 
   size_t size() const
   {
-    return zmq_msg_size(const_cast<zmq_msg_t*>(&msg));
+    return zmq_msg_size(const_cast<zmq_msg_t*>(&_msg));
   }
 
   const void* data() const
   {
-    return zmq_msg_data(const_cast<zmq_msg_t*>(&msg));
+    return zmq_msg_data(const_cast<zmq_msg_t*>(&_msg));
   }
 
   void* data()
   {
-    return zmq_msg_data(&msg);
+    return zmq_msg_data(&_msg);
   }
 
   bool more() const
   {
-    return zmq_msg_more(const_cast<zmq_msg_t*>(&msg)) != 0;
+    return zmq_msg_more(const_cast<zmq_msg_t*>(&_msg)) != 0;
   }
 
   int
   recv(ZmqSocket &socket, int flags = 0)
   {
-    int rc = zmq_msg_recv(&msg, socket.raw(), flags);
+    int rc = zmq_msg_recv(&_msg, socket.raw(), flags);
     if (unlikely(rc == -1)) {
       errno = zmq_errno();
       mrb_sys_fail(mrb, "Failed to receive ZMQ message");
@@ -152,7 +156,7 @@ struct ZmqMessage
   int
   send(ZmqSocket &socket, int flags = 0)
   {
-    int rc = zmq_msg_send(&msg, socket.raw(), flags);
+    int rc = zmq_msg_send(&_msg, socket.raw(), flags);
     if (unlikely(rc == -1)) {
       errno = zmq_errno();
       mrb_sys_fail(mrb, "Failed to send ZMQ message");
@@ -161,50 +165,9 @@ struct ZmqMessage
   }
 
   private:
-  mrb_state *mrb = nullptr;
-  zmq_msg_t msg;
-
-  static void
-  ensure_pair_socket(ZmqSocket &socket)
-  {
-    int type = 0;
-    size_t size = sizeof(type);
-
-    if (unlikely(zmq_getsockopt(socket.raw(), ZMQ_TYPE, &type, &size) != 0)) {
-      errno = zmq_errno();
-      mrb_sys_fail(socket.mrb, "Failed to query ZMQ socket type");
-    }
-
-    if (unlikely(type != ZMQ_PAIR)) {
-      mrb_state *mrb = socket.mrb;
-      mrb_raise(mrb, E_ARGUMENT_ERROR,
-        "send_struct() may only be used on ZMQ_PAIR sockets"
-      );
-    }
-  }
-
-  static void
-  ensure_inproc_socket(ZmqSocket &socket)
-  {
-    char endpoint[256];
-    size_t size = sizeof(endpoint);
-
-    if (unlikely(zmq_getsockopt(socket.raw(), ZMQ_LAST_ENDPOINT, endpoint, &size) != 0)) {
-      errno = zmq_errno();
-      mrb_sys_fail(
-        socket.mrb,
-        "Failed to query ZMQ socket endpoint"
-      );
-    }
-
-    // Must start with "inproc://"
-    if (unlikely(std::strncmp(endpoint, "inproc://", 9) != 0)) {
-      mrb_state *mrb = socket.mrb;
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "send_struct() may only be used on inproc:// PAIR sockets");
-    }
-  }
+  mrb_state *mrb;
+  zmq_msg_t _msg;
 };
-
 
 struct Opcode
 {
@@ -251,40 +214,32 @@ struct Opcode
 class ActorThreadContext
 {
   std::string endpoint;
-  mrb_state *mrb = nullptr;
   std::optional<ZmqSocket> pair_socket;
-  std::optional<ZmqSocket> router_socket;
+  mrb_value actor_classes;
 
   public:
 
-  const mrb_state *get_mrb() const noexcept
+  ActorThreadContext(const std::string& addr, mrb_value actor_classes) : endpoint(addr), actor_classes(actor_classes)
   {
-    return mrb;
   }
 
-  ActorThreadContext(const std::string& addr) : endpoint(addr)
+  mrb_bool
+  array_includes_class(mrb_state *mrb, struct RClass *klass)
   {
-    mrb = mrb_open();
-    if (unlikely(!mrb)) {
-      throw std::runtime_error("Failed to create mruby state in actor thread");
+    mrb_int len = RARRAY_LEN(actor_classes);
+    mrb_value klass_name = mrb_class_path(mrb, klass);
+    for (mrb_int i = 0; i < len; i++) {
+      mrb_value elem = mrb_class_path(mrb, mrb_class_ptr(mrb_ary_ref(mrb, actor_classes, i)));
+
+      if (mrb_str_equal(mrb, elem, klass_name)) {
+          return TRUE;
+      }
     }
-    pair_socket.emplace(mrb, ZMQ_PAIR);
-    pair_socket->connect(endpoint.c_str());
-    router_socket.emplace(mrb, ZMQ_ROUTER);
-    mrb_gv_set(mrb, MRB_SYM(__actor_objects__), mrb_hash_new(mrb));
-
-    Opcode::send(*pair_socket, Opcode::Code::READY);
+    return FALSE;
   }
 
-  ~ActorThreadContext()
-  {
-    if (likely(mrb)) {
-      mrb_close(mrb);
-      mrb = nullptr;
-    }
-  }
 
-  void handle_opcode_create_object_inproc()
+  void handle_opcode_create_object_inproc(mrb_state *mrb)
   {
     ZmqMessage class_id_msg(mrb);
     int rc = class_id_msg.recv(*pair_socket);
@@ -294,33 +249,21 @@ class ActorThreadContext
     const mrb_sym class_id =
       *static_cast<const mrb_sym*>(class_id_msg.data());
 
-    ZmqMessage args_msg(mrb);
-    rc = args_msg.recv(*pair_socket);
-    mrb_value args_str = mrb_str_new_static(mrb,
-      static_cast<const char*>(args_msg.data()),
-      args_msg.size()
-    );
-    mrb_value args_value = mrb_msgpack_unpack(mrb, args_str);
-    if (unlikely(!mrb_array_p(args_value) && !mrb_nil_p(args_value))) {
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "Args argument is not an Array or nil");
+    mrb_value args_value = mrb_nil_value();
+
+    if (class_id_msg.more()) {
+      ZmqMessage args_msg(mrb);
+      args_msg.recv(*pair_socket);
+      mrb_value args_str = mrb_str_new_static(mrb,
+        static_cast<const char*>(args_msg.data()),
+        args_msg.size()
+      );
+      args_value = mrb_msgpack_unpack(mrb, args_str);
     }
 
-    ZmqMessage blk_msg(mrb);
-    blk_msg.recv(*pair_socket);
-    mrb_value blk_str = mrb_str_new_static(mrb,
-      static_cast<const char*>(blk_msg.data()),
-      blk_msg.size()
-    );
-    mrb_value blk_value = mrb_msgpack_unpack(mrb, blk_str);
-    if (unlikely(!mrb_nil_p(blk_value) && !mrb_proc_p(blk_value))) {
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "Block argument is not a Proc or nil");
-    }
-
-    mrb_value klass = mrb_obj_value(mrb_class_get_id(mrb, class_id));
-    mrb_value obj = mrb_instance_new(mrb, klass);
-    obj = mrb_funcall_with_block(mrb, obj, MRB_SYM(initialize), mrb_array_p(args_value) ? RARRAY_LEN(args_value) : 0,
-        mrb_array_p(args_value) ? RARRAY_PTR(args_value) : nullptr,
-        blk_value
+    mrb_value obj = mrb_obj_new(mrb, mrb_class_get_id(mrb, class_id),
+        mrb_array_p(args_value) ? RARRAY_LEN(args_value) : 0,
+        mrb_array_p(args_value) ? RARRAY_PTR(args_value) : nullptr
       );
 
     if (mrb->exc) {
@@ -332,10 +275,10 @@ class ActorThreadContext
       ZmqMessage exc_msg(mrb, RSTRING_PTR(packed), RSTRING_LEN(packed));
       exc_msg.send(*pair_socket);
     } else {
-      mrb_value actor_objects = mrb_gv_get(mrb, MRB_SYM(__actor_objects__));
+      mrb_value actor_objects = mrb_gv_get(mrb, MRB_SYM(__mrb_actor_objects__));
       assert(mrb_hash_p(actor_objects));
       mrb_int object_id = mrb_obj_id(obj);
-      mrb_hash_set(mrb, actor_objects, mrb_convert_number(mrb, object_id), obj);
+      mrb_hash_set(mrb, actor_objects, mrb_int_value(mrb, object_id), obj);
       Opcode::send(*pair_socket, Opcode::Code::OBJECT_CREATED_INPROC, ZMQ_SNDMORE);
       ZmqMessage obj_id_msg(mrb, &object_id, sizeof(object_id));
       obj_id_msg.send(*pair_socket);
@@ -343,7 +286,7 @@ class ActorThreadContext
   }
 
   mrb_value
-  handle_opcode_call_method_inproc_and_forget()
+  handle_opcode_call_method_inproc_and_forget(mrb_state *mrb)
   {
     ZmqMessage obj_id_msg(mrb);
     int rc = obj_id_msg.recv(*pair_socket);
@@ -352,7 +295,7 @@ class ActorThreadContext
     }
     const mrb_int object_id =
       *static_cast<const mrb_int*>(obj_id_msg.data());
-    mrb_value actor_objects = mrb_gv_get(mrb, MRB_SYM(__actor_objects__));
+    mrb_value actor_objects = mrb_gv_get(mrb, MRB_SYM(__mrb_actor_objects__));
     assert(mrb_hash_p(actor_objects));
     mrb_value obj_id_key = mrb_int_value(mrb, object_id);
     mrb_value target_obj = mrb_hash_get(mrb, actor_objects, obj_id_key);
@@ -368,26 +311,34 @@ class ActorThreadContext
     const mrb_sym method_id =
       *static_cast<const mrb_sym*>(func_msg.data());
 
-    ZmqMessage arg_msg(mrb);
-    rc = arg_msg.recv(*pair_socket);
-    mrb_value arg_str = mrb_str_new_static(mrb,
-      static_cast<const char*>(arg_msg.data()),
-      arg_msg.size()
-    );
-    mrb_value arg_value = mrb_msgpack_unpack(mrb, arg_str);
-    if (unlikely(!mrb_array_p(arg_value) && !mrb_nil_p(arg_value))) {
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "Args argument is not an Array or nil");
-    }
+    mrb_value arg_value = mrb_nil_value();
+    mrb_value blk_value = mrb_nil_value();
 
-    ZmqMessage blk_msg(mrb);
-    blk_msg.recv(*pair_socket);
-    mrb_value blk_str = mrb_str_new_static(mrb,
-      static_cast<const char*>(blk_msg.data()),
-      blk_msg.size()
-    );
-    mrb_value blk_value = mrb_msgpack_unpack(mrb, blk_str);
-    if (unlikely(!mrb_nil_p(blk_value) && !mrb_proc_p(blk_value))) {
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "Block argument is not a Proc or nil");
+    // Check if args frame exists
+    if (func_msg.more()) {
+      ZmqMessage args_msg(mrb);
+      args_msg.recv(*pair_socket);
+      mrb_value args_str = mrb_str_new_static(mrb,
+        static_cast<const char*>(args_msg.data()),
+        args_msg.size()
+      );
+      arg_value = mrb_msgpack_unpack(mrb, args_str);
+      if (args_msg.more()) {
+        ZmqMessage blk_msg(mrb);
+        blk_msg.recv(*pair_socket);
+
+        mrb_value blk_str = mrb_str_new_static(mrb,
+          static_cast<const char*>(blk_msg.data()),
+          blk_msg.size()
+        );
+        blk_value = mrb_msgpack_unpack(mrb, blk_str);
+        // After reading block frame (if present)
+        if (blk_msg.more()) {
+            // Protocol violation: unexpected extra frames
+            // In inproc mode, safest action is to abort
+            mrb_raise(mrb, E_RUNTIME_ERROR, "Malformed message: unexpected extra frames");
+        }
+      }
     }
 
     return mrb_funcall_with_block(mrb, target_obj, method_id,
@@ -397,9 +348,9 @@ class ActorThreadContext
       );
   }
 
-  void handle_opcode_call_method_inproc()
+  void handle_opcode_call_method_inproc(mrb_state *mrb)
   {
-    mrb_value ret = handle_opcode_call_method_inproc_and_forget();
+    mrb_value ret = handle_opcode_call_method_inproc_and_forget(mrb);
     if (mrb->exc) {
       mrb_value exc = mrb_obj_value(mrb->exc);
       mrb_clear_error(mrb);
@@ -415,7 +366,7 @@ class ActorThreadContext
     }
   }
 
-  void handle_opcode_destroy_object_inproc()
+  void handle_opcode_destroy_object_inproc(mrb_state *mrb)
   {
     ZmqMessage obj_id_msg(mrb);
     int rc = obj_id_msg.recv(*pair_socket);
@@ -424,53 +375,87 @@ class ActorThreadContext
     }
     const mrb_int object_id =
       *static_cast<const mrb_int*>(obj_id_msg.data());
-    mrb_value actor_objects = mrb_gv_get(mrb, MRB_SYM(__actor_objects__));
+    mrb_value actor_objects = mrb_gv_get(mrb, MRB_SYM(__mrb_actor_objects__));
     assert(mrb_hash_p(actor_objects));
     mrb_value obj_id_key = mrb_int_value(mrb, object_id);
     mrb_hash_delete_key(mrb, actor_objects, obj_id_key);
   }
 
+  static mrb_value
+  mrb_actor_step(mrb_state* mrb, mrb_value self)
+  {
+    mrb_value env = mrb_proc_cfunc_env_get(mrb, 0);
+    ActorThreadContext *ctx = static_cast<ActorThreadContext*>(mrb_cptr(env));
+
+    std::pair <uint8_t, bool> frame = Opcode::recv(*ctx->pair_socket);
+    if (frame.first == static_cast<uint8_t>(Opcode::Code::SHUTDOWN)) {
+      return mrb_false_value();
+    } else if (frame.first == static_cast<uint8_t>(Opcode::Code::CREATE_OBJECT_INPROC)) {
+      ctx->handle_opcode_create_object_inproc(mrb);
+    } else if (frame.first == static_cast<uint8_t>(Opcode::Code::CALL_METHOD_INPROC)) {
+      ctx->handle_opcode_call_method_inproc(mrb);
+    } else if (frame.first == static_cast<uint8_t>(Opcode::Code::CALL_METHOD_INPROC_AND_FORGET)) {
+      ctx->handle_opcode_call_method_inproc_and_forget(mrb);
+    } else if (frame.first == static_cast<uint8_t>(Opcode::Code::DESTROY_OBJECT_INPROC)) {
+      ctx->handle_opcode_destroy_object_inproc(mrb);
+    } else {
+      mrb_raise(mrb, E_RUNTIME_ERROR, "Unknown opcode in mrb_actor_step");
+    }
+    return mrb_true_value();
+  }
+
   void
   run_actor()
   {
-    zmq_pollitem_t items[] = {
-      { pair_socket->raw(),   0, ZMQ_POLLIN, 0 },
-      { router_socket->raw(), 0, ZMQ_POLLIN, 0 }
-    };
-
-    while (true) {
-      int rc = zmq_poll(items, 2, -1);
-      if (rc <= 0) {
-        break;
-      }
-
-      if (items[0].revents & ZMQ_POLLIN) {
-        std::pair <uint8_t, bool> frame = Opcode::recv(*pair_socket);
-
-
-
-        // TODO: dispatch opcode here
-
-        if (frame.first == static_cast<uint8_t>(Opcode::Code::SHUTDOWN)) {
-          break;
-        } else if (frame.first == static_cast<uint8_t>(Opcode::Code::CREATE_OBJECT_INPROC)) {
-          handle_opcode_create_object_inproc();
-        } else if (frame.first == static_cast<uint8_t>(Opcode::Code::CALL_METHOD_INPROC)) {
-          handle_opcode_call_method_inproc();
-        } else if (frame.first == static_cast<uint8_t>(Opcode::Code::CALL_METHOD_INPROC_AND_FORGET)) {
-          handle_opcode_call_method_inproc_and_forget();
-        } else if (frame.first == static_cast<uint8_t>(Opcode::Code::DESTROY_OBJECT_INPROC)) {
-          handle_opcode_destroy_object_inproc();
-        }
-      }
-      if (items[1].revents & ZMQ_POLLIN) {
-        // TODO: external routing
-      }
-
-      items[0].revents = 0;
-      items[1].revents = 0;
-      mrb_gc_arena_restore(mrb, 0);
+    mrb_state *mrb = mrb_open();
+    if (unlikely(!mrb)) {
+      throw std::runtime_error("Failed to create mruby state in actor thread");
     }
+    mrb_zmq_set_context(mrb, mrb_actor_zmq_context);
+    mrb_value msgpack_mod = mrb_obj_value(mrb_module_get_id(mrb, MRB_SYM(MessagePack)));
+
+    mrb_funcall_id(mrb,
+                  msgpack_mod,
+                  MRB_SYM(sym_strategy),
+                  1,
+                  mrb_symbol_value(MRB_SYM(int)));
+
+    pair_socket.emplace(mrb, ZMQ_PAIR);
+    pair_socket->connect(endpoint.c_str());
+    mrb_gv_set(mrb, MRB_SYM(__mrb_actor_objects__), mrb_hash_new(mrb));
+
+    mrb_value env = mrb_cptr_value(mrb, this);
+    struct RProc* cfunc = mrb_proc_new_cfunc_with_env(
+        mrb,
+        mrb_actor_step,
+        1,
+        &env
+    );
+
+    struct RClass* actor = mrb_singleton_class_ptr(mrb, mrb_obj_value(mrb_class_get_id(mrb, MRB_SYM(Actor))));
+
+    mrb_method_t m;
+    MRB_METHOD_FROM_PROC(m, cfunc);
+
+    mrb_define_method_raw(mrb, actor, MRB_SYM(_step), m);
+
+    static const char *run_code =
+      "Proc.new do\n"
+      " while Actor._step()\n"
+      " end\n"
+      "end\n";
+    int idx = mrb_gc_arena_save(mrb);
+    mrb_value proc = mrb_load_string(mrb, run_code);
+    if(mrb->exc) {
+      mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
+    }
+    mrb_gc_arena_restore(mrb, idx);
+    Opcode::send(*pair_socket, Opcode::Code::READY);
+    mrb_top_run(mrb, mrb_proc_ptr(proc), mrb_top_self(mrb), 0);
+    if (mrb->exc) {
+      mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
+    }
+    mrb_close(mrb);
   }
 };
 
@@ -493,7 +478,7 @@ class mrb_actor_mailbox
 
   public:
 
-  mrb_actor_mailbox(mrb_state *owner_mrb) : owner_mrb(owner_mrb), owner_pair_socket(owner_mrb, ZMQ_PAIR)
+  mrb_actor_mailbox(mrb_state *owner_mrb, mrb_value actor_classes) : owner_mrb(owner_mrb), owner_pair_socket(owner_mrb, ZMQ_PAIR)
   {
     mrb_state *mrb = owner_mrb;
     endpoint = make_mailbox_endpoint();
@@ -501,12 +486,8 @@ class mrb_actor_mailbox
     owner_pair_socket.bind(endpoint.c_str());
 
     // Create actor thread context
-    ctx.emplace(endpoint);
-
-    std::pair <uint8_t, bool> frame = Opcode::recv(owner_pair_socket);
-    if (frame.first != static_cast<uint8_t>(Opcode::Code::READY)) {
-      mrb_raise(mrb, E_RUNTIME_ERROR, "Failed to receive READY from actor thread");
-    }
+    actor_classes = mrb_msgpack_unpack(mrb, mrb_msgpack_pack(mrb, actor_classes));
+    ctx.emplace(endpoint, actor_classes);
   }
 
   ~mrb_actor_mailbox()
@@ -528,16 +509,22 @@ class mrb_actor_mailbox
     thread = std::thread([this] {
       ctx->run_actor();
     });
+
+    mrb_state *mrb = owner_mrb;
+    std::pair <uint8_t, bool> frame = Opcode::recv(owner_pair_socket);
+    if (frame.first != static_cast<uint8_t>(Opcode::Code::READY)) {
+      mrb_raise(mrb, E_RUNTIME_ERROR, "Failed to receive READY from actor thread");
+    }
   }
 
   mrb_value
   create_inproc_object(struct RClass *klass,
-                         mrb_value *argv, mrb_int argc, mrb_value blk)
+                         mrb_value *argv, mrb_int argc)
   {
     mrb_state *mrb = owner_mrb;
     mrb_class_path(mrb, klass);
     mrb_sym nsym = MRB_SYM(__classname__);
-    mrb_value path = mrb_obj_iv_get(mrb, (struct RObject*)klass, nsym);
+    mrb_value path = mrb_obj_iv_get(mrb, (struct RObject*) klass, nsym);
     if(!mrb_symbol_p(path)) {
       mrb_raise(mrb, E_RUNTIME_ERROR, "Failed to get class path");
     }
@@ -545,17 +532,15 @@ class mrb_actor_mailbox
 
     mrb_sym class_id = mrb_symbol(path);
     ZmqMessage class_id_msg(mrb, &class_id, sizeof(class_id));
-    class_id_msg.send(owner_pair_socket, ZMQ_SNDMORE);
+    class_id_msg.send(owner_pair_socket, argc ? ZMQ_SNDMORE : 0);
 
-    // Send args
-    mrb_value packed_args = mrb_msgpack_pack_argv(mrb, argv, argc);
-    ZmqMessage args_msg(mrb, RSTRING_PTR(packed_args), RSTRING_LEN(packed_args));
-    args_msg.send(owner_pair_socket, ZMQ_SNDMORE);
+    // Optional args frame
+    if (argc > 0) {
+      mrb_value packed_args = mrb_msgpack_pack_argv(mrb, argv, argc);
+      ZmqMessage args_msg(mrb, RSTRING_PTR(packed_args), RSTRING_LEN(packed_args));
+      args_msg.send(owner_pair_socket);
+    }
 
-    // Send blk
-    mrb_value packed_blk = mrb_msgpack_pack(mrb, blk);
-    ZmqMessage blk_msg(mrb, RSTRING_PTR(packed_blk), RSTRING_LEN(packed_blk));
-    blk_msg.send(owner_pair_socket);
 
     // Wait for OBJECT_CREATED response
     std::pair <uint8_t, bool> frame = Opcode::recv(owner_pair_socket);
@@ -590,15 +575,19 @@ class mrb_actor_mailbox
     obj_id_msg.send(owner_pair_socket, ZMQ_SNDMORE);
 
     ZmqMessage method_id_msg(mrb, &method_id, sizeof(method_id));
-    method_id_msg.send(owner_pair_socket, ZMQ_SNDMORE);
+    method_id_msg.send(owner_pair_socket, argc ? ZMQ_SNDMORE : 0);
 
-    mrb_value packed_args = mrb_msgpack_pack_argv(mrb, argv, argc);
-    ZmqMessage args_msg(mrb, RSTRING_PTR(packed_args), RSTRING_LEN(packed_args));
-    args_msg.send(owner_pair_socket, ZMQ_SNDMORE);
+    if (argc > 0) {
+      mrb_value packed_args = mrb_msgpack_pack_argv(mrb, argv, argc);
+      ZmqMessage args_msg(mrb, RSTRING_PTR(packed_args), RSTRING_LEN(packed_args));
+      args_msg.send(owner_pair_socket, mrb_proc_p(blk) ? ZMQ_SNDMORE : 0);
+    }
 
-    mrb_value packed_blk = mrb_msgpack_pack(mrb, blk);
-    ZmqMessage blk_msg(mrb, RSTRING_PTR(packed_blk), RSTRING_LEN(packed_blk));
-    blk_msg.send(owner_pair_socket);
+    if (mrb_proc_p(blk)) {
+      mrb_value packed_blk = mrb_msgpack_pack(mrb, blk);
+      ZmqMessage blk_msg(mrb, RSTRING_PTR(packed_blk), RSTRING_LEN(packed_blk));
+      blk_msg.send(owner_pair_socket);
+    }
 
     std::pair <uint8_t, bool> frame = Opcode::recv(owner_pair_socket);
     if (frame.first == static_cast<uint8_t>(Opcode::Code::RETURN_VALUE_INPROC)) {
@@ -637,22 +626,27 @@ class mrb_actor_mailbox
     obj_id_msg.send(owner_pair_socket, ZMQ_SNDMORE);
 
     ZmqMessage method_id_msg(mrb, &method_id, sizeof(method_id));
-    method_id_msg.send(owner_pair_socket, ZMQ_SNDMORE);
+    method_id_msg.send(owner_pair_socket, argc ? ZMQ_SNDMORE : 0);
 
-    mrb_value packed_args = mrb_msgpack_pack_argv(mrb, argv, argc);
-    ZmqMessage args_msg(mrb, RSTRING_PTR(packed_args), RSTRING_LEN(packed_args));
-    args_msg.send(owner_pair_socket, ZMQ_SNDMORE);
+    if (argc > 0) {
+      mrb_value packed_args = mrb_msgpack_pack_argv(mrb, argv, argc);
+      ZmqMessage args_msg(mrb, RSTRING_PTR(packed_args), RSTRING_LEN(packed_args));
+      args_msg.send(owner_pair_socket, mrb_proc_p(blk) ? ZMQ_SNDMORE: 0);
+    }
 
-    mrb_value packed_blk = mrb_msgpack_pack(mrb, blk);
-    ZmqMessage blk_msg(mrb, RSTRING_PTR(packed_blk), RSTRING_LEN(packed_blk));
-    blk_msg.send(owner_pair_socket);
+    if (mrb_proc_p(blk)) {
+      mrb_value packed_blk = mrb_msgpack_pack(mrb, blk);
+      ZmqMessage blk_msg(mrb, RSTRING_PTR(packed_blk), RSTRING_LEN(packed_blk));
+      blk_msg.send(owner_pair_socket);
+    }
+
   }
 
   void
   destroy_inproc_object(mrb_int object_id)
   {
     mrb_state *mrb = owner_mrb;
-    Opcode::send(owner_pair_socket, Opcode::Code::DESTROY_OBJECT_INPROC);
+    Opcode::send(owner_pair_socket, Opcode::Code::DESTROY_OBJECT_INPROC, ZMQ_SNDMORE);
     ZmqMessage obj_id_msg(mrb, &object_id, sizeof(object_id));
     obj_id_msg.send(owner_pair_socket);
   }
@@ -663,7 +657,9 @@ MRB_CPP_DEFINE_TYPE(mrb_actor_mailbox, mrb_actor_mailbox);
 static mrb_value
 mrb_actor_new(mrb_state* mrb, mrb_value self)
 {
-  mrb_actor_mailbox* mailbox = mrb_cpp_new<mrb_actor_mailbox>(mrb, self, mrb);
+  struct RClass *actorizable_mod = mrb_module_get_id(mrb, MRB_SYM(Actorizable));
+  mrb_value actor_classes = mrb_iv_get(mrb, mrb_obj_value(actorizable_mod), MRB_IVSYM(actor_classes));
+  mrb_actor_mailbox* mailbox = mrb_cpp_new<mrb_actor_mailbox>(mrb, self, mrb, actor_classes);
   mailbox->run();
 
   return self;
@@ -706,7 +702,7 @@ mrb_actor_object_call_method(mrb_state* mrb, mrb_value self)
   mrb_value *argv = nullptr;
   mrb_int argc = 0;
   mrb_value blk = mrb_nil_value();
-  mrb_get_args(mrb, "n*&", &method_id, &argv, &argc, &blk);
+  mrb_get_args(mrb, "n|*&", &method_id, &argv, &argc, &blk);
 
   return actor_obj->mailbox->call_method_inproc(
     actor_obj->object_id, method_id, argv, argc, blk
@@ -723,7 +719,7 @@ mrb_actor_object_call_method_and_forget(mrb_state* mrb, mrb_value self)
   mrb_value *argv = nullptr;
   mrb_int argc = 0;
   mrb_value blk = mrb_nil_value();
-  mrb_get_args(mrb, "n*&", &method_id, &argv, &argc, &blk);
+  mrb_get_args(mrb, "n|*&", &method_id, &argv, &argc, &blk);
   actor_obj->mailbox->call_method_inproc_and_forget(
     actor_obj->object_id, method_id, argv, argc, blk
   );
@@ -737,14 +733,13 @@ mrb_actor_create_inproc_object(mrb_state* mrb, mrb_value self)
     mrb_data_get_ptr(mrb, self, &mrb_actor_mailbox_type)
   );
 
-  struct RClass* klass;
+  struct RClass* klass = nullptr;
   mrb_value *argv = nullptr;
   mrb_int argc = 0;
-  mrb_value blk = mrb_nil_value();
 
-  mrb_get_args(mrb, "c*&", &klass, &argv, &argc, &blk);
+  mrb_get_args(mrb, "c|*", &klass, &argv, &argc);
 
-  mrb_value object_id = mailbox->create_inproc_object(klass, argv, argc, blk);
+  mrb_value object_id = mailbox->create_inproc_object(klass, argv, argc);
   return mrb_obj_new(mrb, mrb_class_get_under_id(mrb, mrb_class(mrb, self), MRB_SYM(ActorInprocObject)), 2,
     (mrb_value[]){ self, object_id }
   );
@@ -771,13 +766,22 @@ mrb_mruby_actor_gem_init(mrb_state* mrb)
   if (unlikely(!mrb_actor_zmq_context)) {
     mrb_sys_fail(mrb, "Failed to create ZMQ context");
   }
+  mrb_value msgpack_mod = mrb_obj_value(mrb_module_get_id(mrb, MRB_SYM(MessagePack)));
+
+  /* Call: MessagePack.sym_strategy(:int) */
+  mrb_funcall_id(mrb,
+                msgpack_mod,
+                MRB_SYM(sym_strategy),
+                1,
+                mrb_symbol_value(MRB_SYM(int)));
 
   struct RClass *actor_class, *actor_inproc_object_class;
   actor_class = mrb_define_class_id(mrb, MRB_SYM(Actor), mrb->object_class);
+  mrb_define_class_id(mrb, MRB_SYM(ActorModel), mrb->object_class);
   MRB_SET_INSTANCE_TT(actor_class, MRB_TT_DATA);
   mrb_define_method_id(mrb, actor_class, MRB_SYM(initialize), mrb_actor_new, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, actor_class, MRB_SYM(new_inproc), mrb_actor_create_inproc_object,
-    MRB_ARGS_REQ(1)|MRB_ARGS_BLOCK()|MRB_ARGS_REST());
+    MRB_ARGS_REQ(1)|MRB_ARGS_REST());
   actor_inproc_object_class = mrb_define_class_under_id(mrb, actor_class, MRB_SYM(ActorInprocObject), mrb->object_class);
   MRB_SET_INSTANCE_TT(actor_inproc_object_class, MRB_TT_DATA);
   mrb_define_method_id(mrb, actor_inproc_object_class, MRB_SYM(initialize), mrb_actor_object_initialize,

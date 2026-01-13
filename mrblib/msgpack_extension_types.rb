@@ -8,7 +8,7 @@ unless MessagePack.ext_unpacker_registered? (10)
     data = MessagePack.unpack(data)
     exc_class = data[0].constantize
     exc = exc_class.new(data[1])
-    exc.set_backtrace(data[2])
+    exc.set_backtrace(data[2]) if data[2]
     exc
   end
 end
@@ -21,5 +21,16 @@ end
 unless MessagePack.ext_unpacker_registered? (11)
   MessagePack.register_unpack_type(11) do |data|
     Proc.from_irep(data)
+  end
+end
+
+unless MessagePack.ext_packer_registered? (Class)
+  MessagePack.register_pack_type(12, Class) do |klass|
+    klass.name
+  end
+end
+unless MessagePack.ext_unpacker_registered? (12)
+  MessagePack.register_unpack_type(12) do |data|
+    data.constantize
   end
 end
