@@ -16,13 +16,19 @@ class Testme
   include Actorizable
 end
 
+module Outer
+  class Testme
+    include Actorizable
+  end
+end
+
 module Testcode
   class << self
     def run
-      actor = Actor.new
-      obj = actor.new_inproc(String, "15")
-      1000000.times do
-        obj.call_and_forget(:to_i, 10)
+      actor = InprocActor.new
+      obj = actor.new(String, "Hello!")
+      1000.times do
+        obj.send_and_forget(:to_s)
       end
     end
   end

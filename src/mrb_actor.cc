@@ -31,7 +31,7 @@ MRB_END_DECL
 #include <mruby/zmq.h>
 #include <mruby/proc.h>
 #include <mruby/class.h>
-#include <print>
+#include <chrono>
 
 static void *mrb_actor_zmq_context = nullptr;
 static std::once_flag zmq_context_once;
@@ -145,12 +145,21 @@ struct ZmqMessage
   int
   recv(ZmqSocket &socket, int flags = 0)
   {
-    int rc = zmq_msg_recv(&_msg, socket.raw(), flags);
-    if (unlikely(rc == -1)) {
-      errno = zmq_errno();
-      mrb_sys_fail(mrb, "Failed to receive ZMQ message");
-    }
-    return rc;
+      int rc = zmq_msg_recv(&_msg, socket.raw(), flags);
+
+      if (rc == -1) {
+          errno = zmq_errno();
+
+          // Non-blocking receive: no message available
+          if ((flags & ZMQ_DONTWAIT) && errno == EAGAIN) {
+              return -1; // caller interprets as "no message"
+          }
+
+          // Real error
+          mrb_sys_fail(mrb, "Failed to receive ZMQ message");
+      }
+
+      return rc;
   }
 
   int
@@ -171,80 +180,99 @@ struct ZmqMessage
 
 struct Opcode
 {
-  enum class Code : uint8_t
+  enum : uint8_t
   {
-    CREATE_OBJECT_INPROC          = 1,
-    CALL_METHOD_INPROC            = 2,
-    CALL_METHOD_INPROC_AND_FORGET = 3,
-    DESTROY_OBJECT_INPROC         = 4,
-    SHUTDOWN                      = 5,
+    READY                  = 0,
+    SHUTDOWN               = 1,
 
-    RETURN_VALUE_INPROC           = 10,
-    RAISE_EXCEPTION               = 11,
-    OBJECT_CREATED_INPROC         = 12,
-    READY                         = 13,
+    CREATE_OBJECT          = 20,
+    DESTROY_OBJECT         = 21,
+    OBJECT_CREATED         = 22,
 
-    MALFORMED_OPCODE              = 255
+    CALL_METHOD            = 40,
+    CALL_METHOD_AND_FORGET = 41,
+    RETURN_VALUE           = 42,
+    RAISE_EXCEPTION        = 43,
+
+    CALL_FUTURE            = 60,
+    FUTURE_VALUE           = 61,
+    FUTURE_EXCEPTION       = 62,
+
+    TIMEOUT                = 100,
+
+    MALFORMED_OPCODE       = 255
   };
 
   static int
-  send(ZmqSocket &socket, Code op, int flags = 0)
+  send(ZmqSocket &socket, uint8_t op, int flags = 0)
   {
     ZmqMessage m(socket.mrb, &op, sizeof(op));
     return m.send(socket, flags);
   }
 
   static std::pair<uint8_t, bool>
-  recv(ZmqSocket &socket)
+  recv(ZmqSocket &socket, int flags = 0)
   {
-    ZmqMessage msg(socket.mrb);
-    msg.recv(socket);
+      ZmqMessage msg(socket.mrb);
+      int rc = msg.recv(socket, flags);
 
-    if (unlikely(msg.size() != sizeof(Code))) {
-      return {static_cast<uint8_t>(Code::MALFORMED_OPCODE), msg.more()} ;
-    }
+      if (rc == -1) {
+          errno = zmq_errno();
 
-    const uint8_t byte =
-      *static_cast<const uint8_t*>(msg.data());
+          // Non-blocking: no message available
+          if ((flags & ZMQ_DONTWAIT) && errno == EAGAIN) {
+              return {static_cast<uint8_t>(TIMEOUT), false};
+          }
 
-    return {byte, msg.more()};
+          // Real error → propagate
+          mrb_sys_fail(socket.mrb, "Failed to receive ZMQ message");
+      }
+
+      // Normal path
+      if (unlikely(msg.size() != sizeof(uint8_t))) {
+          return {static_cast<uint8_t>(MALFORMED_OPCODE), msg.more()};
+      }
+
+      const uint8_t byte =
+          *static_cast<const uint8_t*>(msg.data());
+
+      return {byte, msg.more()};
   }
 };
 
-class ActorThreadContext
+class InprocActorThreadContext
 {
   std::string endpoint;
   std::optional<ZmqSocket> pair_socket;
-  mrb_value actor_classes;
+  mrb_value actor_classes = mrb_undef_value();
+  mrb_state *mrb = nullptr;
 
   public:
 
-  ActorThreadContext(const std::string& addr, mrb_value actor_classes) : endpoint(addr), actor_classes(actor_classes)
+  InprocActorThreadContext(const std::string& addr) : endpoint(addr)
   {
   }
 
-  mrb_bool
-  array_includes_class(mrb_state *mrb, struct RClass *klass)
+  ~InprocActorThreadContext()
   {
-    mrb_int len = RARRAY_LEN(actor_classes);
-    mrb_value klass_name = mrb_class_path(mrb, klass);
-    for (mrb_int i = 0; i < len; i++) {
-      mrb_value elem = mrb_class_path(mrb, mrb_class_ptr(mrb_ary_ref(mrb, actor_classes, i)));
-
-      if (mrb_str_equal(mrb, elem, klass_name)) {
-          return TRUE;
-      }
+    if (mrb) {
+      mrb_close(mrb);
+      mrb = nullptr;
     }
-    return FALSE;
   }
 
-
-  void handle_opcode_create_object_inproc(mrb_state *mrb)
+  void handle_opcode_create_object()
   {
+    ZmqMessage seq_msg(mrb);
+    int rc = seq_msg.recv(*pair_socket);
+    if (unlikely(rc != sizeof(uint64_t))) {
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "Malformed sequence number in CREATE_OBJECT");
+    }
+
     ZmqMessage class_id_msg(mrb);
-    int rc = class_id_msg.recv(*pair_socket);
+    rc = class_id_msg.recv(*pair_socket);
     if (unlikely(rc != sizeof(mrb_sym))) {
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "Malformed class ID in CREATE_OBJECT_INPROC");
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "Malformed class ID in CREATE_OBJECT");
     }
     const mrb_sym class_id =
       *static_cast<const mrb_sym*>(class_id_msg.data());
@@ -266,47 +294,49 @@ class ActorThreadContext
         mrb_array_p(args_value) ? RARRAY_PTR(args_value) : nullptr
       );
 
-    if (mrb->exc) {
+    if (unlikely(mrb->exc)) {
       mrb_value exc = mrb_obj_value(mrb->exc);
       mrb_clear_error(mrb);
       mrb_value packed = mrb_msgpack_pack(mrb, exc);
 
-      Opcode::send(*pair_socket, Opcode::Code::RAISE_EXCEPTION, ZMQ_SNDMORE);
+      Opcode::send(*pair_socket, Opcode::RAISE_EXCEPTION, ZMQ_SNDMORE);
+      seq_msg.send(*pair_socket, ZMQ_SNDMORE);
       ZmqMessage exc_msg(mrb, RSTRING_PTR(packed), RSTRING_LEN(packed));
       exc_msg.send(*pair_socket);
     } else {
       mrb_value actor_objects = mrb_gv_get(mrb, MRB_SYM(__mrb_actor_objects__));
-      assert(mrb_hash_p(actor_objects));
+      mrb_assert(mrb_hash_p(actor_objects));
       mrb_int object_id = mrb_obj_id(obj);
-      mrb_hash_set(mrb, actor_objects, mrb_int_value(mrb, object_id), obj);
-      Opcode::send(*pair_socket, Opcode::Code::OBJECT_CREATED_INPROC, ZMQ_SNDMORE);
+      mrb_hash_set(mrb, actor_objects, mrb_convert_number(mrb, object_id), obj);
+      Opcode::send(*pair_socket, Opcode::OBJECT_CREATED, ZMQ_SNDMORE);
+      seq_msg.send(*pair_socket, ZMQ_SNDMORE);
       ZmqMessage obj_id_msg(mrb, &object_id, sizeof(object_id));
       obj_id_msg.send(*pair_socket);
     }
   }
 
   mrb_value
-  handle_opcode_call_method_inproc_and_forget(mrb_state *mrb)
+  handle_opcode_call_method_and_forget()
   {
     ZmqMessage obj_id_msg(mrb);
     int rc = obj_id_msg.recv(*pair_socket);
     if (unlikely(rc != sizeof(mrb_int))) {
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "Malformed object ID in CALL_METHOD_INPROC_AND_FORGET");
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "Malformed object ID in CALL_METHOD_AND_FORGET");
     }
     const mrb_int object_id =
       *static_cast<const mrb_int*>(obj_id_msg.data());
     mrb_value actor_objects = mrb_gv_get(mrb, MRB_SYM(__mrb_actor_objects__));
-    assert(mrb_hash_p(actor_objects));
-    mrb_value obj_id_key = mrb_int_value(mrb, object_id);
-    mrb_value target_obj = mrb_hash_get(mrb, actor_objects, obj_id_key);
-    if (unlikely(mrb_nil_p(target_obj))) {
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "Object ID not found in CALL_METHOD_INPROC_AND_FORGET");
+    mrb_assert(mrb_hash_p(actor_objects));
+    mrb_value obj_id_key = mrb_convert_number(mrb, object_id);
+    mrb_value target_obj = mrb_hash_fetch(mrb, actor_objects, obj_id_key, mrb_undef_value());
+    if (unlikely(mrb_undef_p(target_obj))) {
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "Object ID not found in CALL_METHOD_AND_FORGET");
     }
 
     ZmqMessage func_msg(mrb);
     rc = func_msg.recv(*pair_socket);
     if (unlikely(rc != sizeof(mrb_sym))) {
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "Malformed method ID in CALL_METHOD_INPROC_AND_FORGET");
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "Malformed method ID in CALL_METHOD_AND_FORGET");
     }
     const mrb_sym method_id =
       *static_cast<const mrb_sym*>(func_msg.data());
@@ -348,36 +378,70 @@ class ActorThreadContext
       );
   }
 
-  void handle_opcode_call_method_inproc(mrb_state *mrb)
+  void handle_opcode_call_future()
   {
-    mrb_value ret = handle_opcode_call_method_inproc_and_forget(mrb);
-    if (mrb->exc) {
+    ZmqMessage seq_msg(mrb);
+    int rc = seq_msg.recv(*pair_socket);
+    if (unlikely(rc != sizeof(uint64_t))) {
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "Malformed sequence number in CALL_METHOD_AND_FORGET");
+    }
+
+    mrb_value ret = handle_opcode_call_method_and_forget();
+    if (unlikely(mrb->exc)) {
       mrb_value exc = mrb_obj_value(mrb->exc);
       mrb_clear_error(mrb);
       mrb_value packed = mrb_msgpack_pack(mrb, exc);
-      Opcode::send(*pair_socket, Opcode::Code::RAISE_EXCEPTION, ZMQ_SNDMORE);
+      Opcode::send(*pair_socket, Opcode::FUTURE_EXCEPTION, ZMQ_SNDMORE);
+      seq_msg.send(*pair_socket, ZMQ_SNDMORE);
       ZmqMessage exc_msg(mrb, RSTRING_PTR(packed), RSTRING_LEN(packed));
       exc_msg.send(*pair_socket);
     } else {
       mrb_value packed = mrb_msgpack_pack(mrb, ret);
-      Opcode::send(*pair_socket, Opcode::Code::RETURN_VALUE_INPROC, ZMQ_SNDMORE);
+      Opcode::send(*pair_socket, Opcode::FUTURE_VALUE, ZMQ_SNDMORE);
+      seq_msg.send(*pair_socket, ZMQ_SNDMORE);
       ZmqMessage ret_msg(mrb, RSTRING_PTR(packed), RSTRING_LEN(packed));
       ret_msg.send(*pair_socket);
     }
   }
 
-  void handle_opcode_destroy_object_inproc(mrb_state *mrb)
+  void handle_opcode_call_method()
+  {
+    ZmqMessage seq_msg(mrb);
+    int rc = seq_msg.recv(*pair_socket);
+    if (unlikely(rc != sizeof(uint64_t))) {
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "Malformed sequence number in CALL_METHOD_AND_FORGET");
+    }
+
+    mrb_value ret = handle_opcode_call_method_and_forget();
+    if (unlikely(mrb->exc)) {
+      mrb_value exc = mrb_obj_value(mrb->exc);
+      mrb_clear_error(mrb);
+      mrb_value packed = mrb_msgpack_pack(mrb, exc);
+      Opcode::send(*pair_socket, Opcode::RAISE_EXCEPTION, ZMQ_SNDMORE);
+      seq_msg.send(*pair_socket, ZMQ_SNDMORE);
+      ZmqMessage exc_msg(mrb, RSTRING_PTR(packed), RSTRING_LEN(packed));
+      exc_msg.send(*pair_socket);
+    } else {
+      mrb_value packed = mrb_msgpack_pack(mrb, ret);
+      Opcode::send(*pair_socket, Opcode::RETURN_VALUE, ZMQ_SNDMORE);
+      seq_msg.send(*pair_socket, ZMQ_SNDMORE);
+      ZmqMessage ret_msg(mrb, RSTRING_PTR(packed), RSTRING_LEN(packed));
+      ret_msg.send(*pair_socket);
+    }
+  }
+
+  void handle_opcode_destroy_object()
   {
     ZmqMessage obj_id_msg(mrb);
     int rc = obj_id_msg.recv(*pair_socket);
     if (unlikely(rc != sizeof(mrb_int))) {
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "Malformed object ID in DESTROY_OBJECT_INPROC");
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "Malformed object ID in DESTROY_OBJECT");
     }
     const mrb_int object_id =
       *static_cast<const mrb_int*>(obj_id_msg.data());
     mrb_value actor_objects = mrb_gv_get(mrb, MRB_SYM(__mrb_actor_objects__));
-    assert(mrb_hash_p(actor_objects));
-    mrb_value obj_id_key = mrb_int_value(mrb, object_id);
+    mrb_assert(mrb_hash_p(actor_objects));
+    mrb_value obj_id_key = mrb_convert_number(mrb, object_id);
     mrb_hash_delete_key(mrb, actor_objects, obj_id_key);
   }
 
@@ -385,19 +449,21 @@ class ActorThreadContext
   mrb_actor_step(mrb_state* mrb, mrb_value self)
   {
     mrb_value env = mrb_proc_cfunc_env_get(mrb, 0);
-    ActorThreadContext *ctx = static_cast<ActorThreadContext*>(mrb_cptr(env));
+    InprocActorThreadContext *ctx = static_cast<InprocActorThreadContext*>(mrb_cptr(env));
 
     std::pair <uint8_t, bool> frame = Opcode::recv(*ctx->pair_socket);
-    if (frame.first == static_cast<uint8_t>(Opcode::Code::SHUTDOWN)) {
+    if (unlikely(frame.first == static_cast<uint8_t>(Opcode::SHUTDOWN))) {
       return mrb_false_value();
-    } else if (frame.first == static_cast<uint8_t>(Opcode::Code::CREATE_OBJECT_INPROC)) {
-      ctx->handle_opcode_create_object_inproc(mrb);
-    } else if (frame.first == static_cast<uint8_t>(Opcode::Code::CALL_METHOD_INPROC)) {
-      ctx->handle_opcode_call_method_inproc(mrb);
-    } else if (frame.first == static_cast<uint8_t>(Opcode::Code::CALL_METHOD_INPROC_AND_FORGET)) {
-      ctx->handle_opcode_call_method_inproc_and_forget(mrb);
-    } else if (frame.first == static_cast<uint8_t>(Opcode::Code::DESTROY_OBJECT_INPROC)) {
-      ctx->handle_opcode_destroy_object_inproc(mrb);
+    } else if (frame.first == static_cast<uint8_t>(Opcode::CALL_METHOD_AND_FORGET)) {
+      ctx->handle_opcode_call_method_and_forget();
+    } else if (frame.first == static_cast<uint8_t>(Opcode::CALL_FUTURE)) {
+      ctx->handle_opcode_call_future();
+    } else if (frame.first == static_cast<uint8_t>(Opcode::CALL_METHOD)) {
+      ctx->handle_opcode_call_method();
+    } else if (frame.first == static_cast<uint8_t>(Opcode::CREATE_OBJECT)) {
+      ctx->handle_opcode_create_object();
+    } else if (frame.first == static_cast<uint8_t>(Opcode::DESTROY_OBJECT)) {
+      ctx->handle_opcode_destroy_object();
     } else {
       mrb_raise(mrb, E_RUNTIME_ERROR, "Unknown opcode in mrb_actor_step");
     }
@@ -405,12 +471,13 @@ class ActorThreadContext
   }
 
   void
-  run_actor()
+  run_actor(mrb_value actor_classes_msg)
   {
-    mrb_state *mrb = mrb_open();
+    mrb = mrb_open();
     if (unlikely(!mrb)) {
       throw std::runtime_error("Failed to create mruby state in actor thread");
     }
+    actor_classes = mrb_msgpack_unpack(mrb, actor_classes_msg);
     mrb_zmq_set_context(mrb, mrb_actor_zmq_context);
     mrb_value msgpack_mod = mrb_obj_value(mrb_module_get_id(mrb, MRB_SYM(MessagePack)));
 
@@ -422,54 +489,47 @@ class ActorThreadContext
 
     pair_socket.emplace(mrb, ZMQ_PAIR);
     pair_socket->connect(endpoint.c_str());
-    mrb_gv_set(mrb, MRB_SYM(__mrb_actor_objects__), mrb_hash_new(mrb));
+    mrb_value mrb_actor_objects = mrb_hash_new(mrb);
+    mrb_gv_set(mrb, MRB_SYM(__mrb_actor_objects__), mrb_actor_objects);
 
     mrb_value env = mrb_cptr_value(mrb, this);
-    struct RProc* cfunc = mrb_proc_new_cfunc_with_env(
+    mrb_value cfunc = mrb_obj_value(mrb_proc_new_cfunc_with_env(
         mrb,
         mrb_actor_step,
         1,
         &env
-    );
+    ));
 
-    struct RClass* actor = mrb_singleton_class_ptr(mrb, mrb_obj_value(mrb_class_get_id(mrb, MRB_SYM(Actor))));
-
-    mrb_method_t m;
-    MRB_METHOD_FROM_PROC(m, cfunc);
-
-    mrb_define_method_raw(mrb, actor, MRB_SYM(_step), m);
-
-    static const char *run_code =
-      "Proc.new do\n"
-      " while Actor._step()\n"
-      " end\n"
-      "end\n";
+    mrb_value running;
+    mrb_value nil = mrb_nil_value();
     int idx = mrb_gc_arena_save(mrb);
-    mrb_value proc = mrb_load_string(mrb, run_code);
-    if(mrb->exc) {
+    Opcode::send(*pair_socket, Opcode::READY);
+    do {
+      running = mrb_yield(mrb, cfunc, nil);
+      mrb_gc_arena_restore(mrb, idx);
+    } while (likely(mrb_true_p(running)));
+
+    if (unlikely(mrb->exc)) {
       mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
     }
-    mrb_gc_arena_restore(mrb, idx);
-    Opcode::send(*pair_socket, Opcode::Code::READY);
-    mrb_top_run(mrb, mrb_proc_ptr(proc), mrb_top_self(mrb), 0);
-    if (mrb->exc) {
-      mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
-    }
-    mrb_close(mrb);
   }
 };
 
-class mrb_actor_mailbox
+
+
+class mrb_inproc_actor_mailbox
 {
   mrb_state *owner_mrb = nullptr;
+  mrb_value self;
   std::thread thread;
-  std::string endpoint;
+  std::string pair_endpoint;
   ZmqSocket owner_pair_socket;
+  mrb_int seq_num = MRB_INT_MIN;
 
-  std::optional<ActorThreadContext> ctx;
+  std::optional<InprocActorThreadContext> ctx;
 
   std::string
-  make_mailbox_endpoint()
+  make_mailbox_pair_endpoint()
   {
     std::ostringstream oss;
     oss << "inproc://mailbox-" << this;
@@ -478,57 +538,61 @@ class mrb_actor_mailbox
 
   public:
 
-  mrb_actor_mailbox(mrb_state *owner_mrb, mrb_value actor_classes) : owner_mrb(owner_mrb), owner_pair_socket(owner_mrb, ZMQ_PAIR)
+  mrb_inproc_actor_mailbox(mrb_state *owner_mrb, mrb_value self) : owner_mrb(owner_mrb), self(self), owner_pair_socket(owner_mrb, ZMQ_PAIR)
   {
     mrb_state *mrb = owner_mrb;
-    endpoint = make_mailbox_endpoint();
+    pair_endpoint = make_mailbox_pair_endpoint();
 
-    owner_pair_socket.bind(endpoint.c_str());
+    owner_pair_socket.bind(pair_endpoint.c_str());
+    mrb_value future_answers = mrb_hash_new(mrb);
+    mrb_iv_set(mrb, self, MRB_SYM(__future_answers__), future_answers);
 
     // Create actor thread context
-    actor_classes = mrb_msgpack_unpack(mrb, mrb_msgpack_pack(mrb, actor_classes));
-    ctx.emplace(endpoint, actor_classes);
+    ctx.emplace(pair_endpoint);
   }
 
-  ~mrb_actor_mailbox()
+  ~mrb_inproc_actor_mailbox()
   {
     if (thread.joinable()) {
-      Opcode::send(owner_pair_socket, Opcode::Code::SHUTDOWN);
+      Opcode::send(owner_pair_socket, Opcode::SHUTDOWN);
       thread.join();
     }
   }
 
-  mrb_actor_mailbox(const mrb_actor_mailbox&) = delete;
-  mrb_actor_mailbox& operator=(const mrb_actor_mailbox&) = delete;
+  mrb_inproc_actor_mailbox(const mrb_inproc_actor_mailbox&) = delete;
+  mrb_inproc_actor_mailbox& operator=(const mrb_inproc_actor_mailbox&) = delete;
 
-  mrb_actor_mailbox(mrb_actor_mailbox&&) = delete;
-  mrb_actor_mailbox& operator=(mrb_actor_mailbox&&) = delete;
+  mrb_inproc_actor_mailbox(mrb_inproc_actor_mailbox&&) = delete;
+  mrb_inproc_actor_mailbox& operator=(mrb_inproc_actor_mailbox&&) = delete;
 
-  void run()
+  void run(mrb_value actor_classes)
   {
-    thread = std::thread([this] {
-      ctx->run_actor();
+    mrb_state *mrb = owner_mrb;
+    mrb_value actor_classes_msg = mrb_msgpack_pack(mrb, actor_classes);
+    thread = std::thread([this, actor_classes_msg] {
+      ctx->run_actor(actor_classes_msg);
     });
 
-    mrb_state *mrb = owner_mrb;
     std::pair <uint8_t, bool> frame = Opcode::recv(owner_pair_socket);
-    if (frame.first != static_cast<uint8_t>(Opcode::Code::READY)) {
+    if (unlikely(frame.first != static_cast<uint8_t>(Opcode::READY))) {
       mrb_raise(mrb, E_RUNTIME_ERROR, "Failed to receive READY from actor thread");
     }
   }
 
   mrb_value
-  create_inproc_object(struct RClass *klass,
+  create_object(struct RClass *klass,
                          mrb_value *argv, mrb_int argc)
   {
     mrb_state *mrb = owner_mrb;
     mrb_class_path(mrb, klass);
     mrb_sym nsym = MRB_SYM(__classname__);
     mrb_value path = mrb_obj_iv_get(mrb, (struct RObject*) klass, nsym);
-    if(!mrb_symbol_p(path)) {
+    if(unlikely(!mrb_symbol_p(path))) {
       mrb_raise(mrb, E_RUNTIME_ERROR, "Failed to get class path");
     }
-    Opcode::send(owner_pair_socket, Opcode::Code::CREATE_OBJECT_INPROC, ZMQ_SNDMORE);
+    Opcode::send(owner_pair_socket, Opcode::CREATE_OBJECT, ZMQ_SNDMORE);
+    ZmqMessage seq_msg(mrb, &++seq_num, sizeof(seq_num));
+    seq_msg.send(owner_pair_socket, ZMQ_SNDMORE);
 
     mrb_sym class_id = mrb_symbol(path);
     ZmqMessage class_id_msg(mrb, &class_id, sizeof(class_id));
@@ -541,41 +605,25 @@ class mrb_actor_mailbox
       args_msg.send(owner_pair_socket);
     }
 
-
-    // Wait for OBJECT_CREATED response
-    std::pair <uint8_t, bool> frame = Opcode::recv(owner_pair_socket);
-    if (frame.first != static_cast<uint8_t>(Opcode::Code::OBJECT_CREATED_INPROC)) {
-      if (frame.first == static_cast<uint8_t>(Opcode::Code::RAISE_EXCEPTION)) {
-        ZmqMessage exc_msg(mrb);
-        exc_msg.recv(owner_pair_socket);
-        mrb_value exc_str = mrb_str_new_static(mrb,
-          static_cast<const char*>(exc_msg.data()),
-          exc_msg.size()
-        );
-        mrb_value exc = mrb_msgpack_unpack(mrb, exc_str);
-        mrb_exc_raise(mrb, exc);
-      }
-    }
-
-    ZmqMessage obj_id_msg(mrb);
-    obj_id_msg.recv(owner_pair_socket);
-    if (obj_id_msg.size() != sizeof(mrb_int)) {
-      mrb_raise(mrb, E_RUNTIME_ERROR, "Malformed OBJECT_CREATED object ID");
-    }
-    return mrb_int_value(mrb, *static_cast<const mrb_int*>(obj_id_msg.data()));
+    return await_response_sync(
+      static_cast<uint8_t>(Opcode::OBJECT_CREATED),
+      seq_num
+    );
   }
 
   mrb_value
-  call_method_inproc(mrb_int object_id, mrb_sym method_id,
+  send(mrb_int object_id, mrb_sym method_id,
                      mrb_value *argv, mrb_int argc, mrb_value blk)
   {
     mrb_state *mrb = owner_mrb;
-    Opcode::send(owner_pair_socket, Opcode::Code::CALL_METHOD_INPROC, ZMQ_SNDMORE);
+    Opcode::send(owner_pair_socket, Opcode::CALL_METHOD, ZMQ_SNDMORE);
+    ZmqMessage seq_msg(mrb, &++seq_num, sizeof(seq_num));
+    seq_msg.send(owner_pair_socket, ZMQ_SNDMORE);
     ZmqMessage obj_id_msg(mrb, &object_id, sizeof(object_id));
     obj_id_msg.send(owner_pair_socket, ZMQ_SNDMORE);
 
     ZmqMessage method_id_msg(mrb, &method_id, sizeof(method_id));
-    method_id_msg.send(owner_pair_socket, argc ? ZMQ_SNDMORE : 0);
+    method_id_msg.send(owner_pair_socket, argc > 0 ? ZMQ_SNDMORE : 0);
 
     if (argc > 0) {
       mrb_value packed_args = mrb_msgpack_pack_argv(mrb, argv, argc);
@@ -589,44 +637,23 @@ class mrb_actor_mailbox
       blk_msg.send(owner_pair_socket);
     }
 
-    std::pair <uint8_t, bool> frame = Opcode::recv(owner_pair_socket);
-    if (frame.first == static_cast<uint8_t>(Opcode::Code::RETURN_VALUE_INPROC)) {
-      ZmqMessage ret_msg(mrb);
-      ret_msg.recv(owner_pair_socket);
-      mrb_value ret_str = mrb_str_new_static(mrb,
-        static_cast<const char*>(ret_msg.data()),
-        ret_msg.size()
-      );
-      return mrb_msgpack_unpack(mrb, ret_str);
-    } else if (frame.first == static_cast<uint8_t>(Opcode::Code::RAISE_EXCEPTION)) {
-      ZmqMessage exc_msg(mrb);
-      exc_msg.recv(owner_pair_socket);
-      mrb_value exc_str = mrb_str_new_static(mrb,
-        static_cast<const char*>(exc_msg.data()),
-        exc_msg.size()
-      );
-      mrb_value exc = mrb_msgpack_unpack(mrb, exc_str);
-      if (unlikely(!mrb_exception_p(exc))) {
-        mrb_raise(mrb, E_RUNTIME_ERROR, "Received non-exception object in RAISE_EXCEPTION");
-      }
-      mrb_exc_raise(mrb, exc);
-    } else {
-      mrb_raise(mrb, E_RUNTIME_ERROR, "Malformed response opcode in CALL_METHOD_INPROC");
-    }
-    return mrb_undef_value(); // Unreachable
+    return await_response_sync(
+      static_cast<uint8_t>(Opcode::RETURN_VALUE),
+      seq_num
+    );
   }
 
   void
-  call_method_inproc_and_forget(mrb_int object_id, mrb_sym method_id,
+  send_and_forget(mrb_int object_id, mrb_sym method_id,
                      mrb_value *argv, mrb_int argc, mrb_value blk)
   {
     mrb_state *mrb = owner_mrb;
-    Opcode::send(owner_pair_socket, Opcode::Code::CALL_METHOD_INPROC_AND_FORGET, ZMQ_SNDMORE);
+    Opcode::send(owner_pair_socket, Opcode::CALL_METHOD_AND_FORGET, ZMQ_SNDMORE);
     ZmqMessage obj_id_msg(mrb, &object_id, sizeof(object_id));
     obj_id_msg.send(owner_pair_socket, ZMQ_SNDMORE);
 
     ZmqMessage method_id_msg(mrb, &method_id, sizeof(method_id));
-    method_id_msg.send(owner_pair_socket, argc ? ZMQ_SNDMORE : 0);
+    method_id_msg.send(owner_pair_socket, argc > 0 ? ZMQ_SNDMORE : 0);
 
     if (argc > 0) {
       mrb_value packed_args = mrb_msgpack_pack_argv(mrb, argv, argc);
@@ -643,38 +670,167 @@ class mrb_actor_mailbox
   }
 
   void
-  destroy_inproc_object(mrb_int object_id)
+  call_future(mrb_int object_id, mrb_sym method_id,
+                     mrb_value *argv, mrb_int argc, mrb_value blk)
   {
     mrb_state *mrb = owner_mrb;
-    Opcode::send(owner_pair_socket, Opcode::Code::DESTROY_OBJECT_INPROC, ZMQ_SNDMORE);
+    Opcode::send(owner_pair_socket, Opcode::CALL_FUTURE, ZMQ_SNDMORE);
+    ZmqMessage seq_msg(mrb, &++seq_num, sizeof(seq_num));
+    mrb_value future_answers = mrb_iv_get(mrb, self, MRB_SYM(__future_answers__));
+    mrb_assert(mrb_hash_p(future_answers));
+    mrb_value seq_key = mrb_convert_number(mrb, seq_num);
+    auto timeout = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    mrb_value pair = mrb_assoc_new(mrb, mrb_convert_number(mrb, Opcode::TIMEOUT), mrb_convert_number(mrb, timeout.time_since_epoch().count()));
+    mrb_hash_set(mrb, future_answers, seq_key, pair);
+    seq_msg.send(owner_pair_socket, ZMQ_SNDMORE);
+    ZmqMessage obj_id_msg(mrb, &object_id, sizeof(object_id));
+    obj_id_msg.send(owner_pair_socket, ZMQ_SNDMORE);
+
+    ZmqMessage method_id_msg(mrb, &method_id, sizeof(method_id));
+    method_id_msg.send(owner_pair_socket, argc > 0 ? ZMQ_SNDMORE : 0);
+
+    if (argc > 0) {
+      mrb_value packed_args = mrb_msgpack_pack_argv(mrb, argv, argc);
+      ZmqMessage args_msg(mrb, RSTRING_PTR(packed_args), RSTRING_LEN(packed_args));
+      args_msg.send(owner_pair_socket, mrb_proc_p(blk) ? ZMQ_SNDMORE : 0);
+    }
+
+    if (mrb_proc_p(blk)) {
+      mrb_value packed_blk = mrb_msgpack_pack(mrb, blk);
+      ZmqMessage blk_msg(mrb, RSTRING_PTR(packed_blk), RSTRING_LEN(packed_blk));
+      blk_msg.send(owner_pair_socket);
+    }
+  }
+
+  void
+  destroy_object(mrb_int object_id)
+  {
+    mrb_state *mrb = owner_mrb;
+    Opcode::send(owner_pair_socket, Opcode::DESTROY_OBJECT, ZMQ_SNDMORE);
     ZmqMessage obj_id_msg(mrb, &object_id, sizeof(object_id));
     obj_id_msg.send(owner_pair_socket);
   }
+
+  protected:
+  void
+  handle_futures(uint8_t opcode)
+  {
+    mrb_state *mrb = owner_mrb;
+    ZmqMessage seq_msg(mrb);
+    int rc = seq_msg.recv(owner_pair_socket);
+    if (unlikely(rc != sizeof(mrb_int))) {
+      mrb_raise(mrb, E_RUNTIME_ERROR, "Malformed sequence number in future response");
+    }
+    mrb_int resp_seq_num =
+      *static_cast<const mrb_int*>(seq_msg.data());
+
+    ZmqMessage payload_msg(mrb);
+    payload_msg.recv(owner_pair_socket);
+    mrb_value payload_str = mrb_str_new_static(mrb,
+      static_cast<const char*>(payload_msg.data()),
+      payload_msg.size()
+    );
+    mrb_value payload = mrb_msgpack_unpack(mrb, payload_str);
+
+    mrb_value future_answers = mrb_iv_get(mrb, self, MRB_SYM(__future_answers__));
+    mrb_assert(mrb_hash_p(future_answers));
+    mrb_value seq_key = mrb_convert_number(mrb, resp_seq_num);
+    mrb_value pair = mrb_assoc_new(mrb,
+      mrb_convert_number(mrb, opcode),
+      payload
+    );
+    mrb_hash_set(mrb, future_answers, seq_key, pair);
+  }
+
+  mrb_value
+  handle_sync_calls(uint8_t expected_type_class, mrb_int expected_seq_num)
+  {
+    mrb_state *mrb = owner_mrb;
+    ZmqMessage seq_msg(mrb);
+    int rc = seq_msg.recv(owner_pair_socket);
+    if (unlikely(rc != sizeof(mrb_int))) {
+      mrb_raise(mrb, E_RUNTIME_ERROR, "Malformed sequence number in response");
+    }
+    mrb_int resp_seq_num =
+      *static_cast<const mrb_int*>(seq_msg.data());
+    if (unlikely(resp_seq_num != expected_seq_num)) {
+      mrb_raise(mrb, E_RUNTIME_ERROR, "Mismatched sequence number in response");
+    }
+
+    switch (expected_type_class) {
+      case static_cast<uint8_t>(Opcode::RETURN_VALUE): {
+        ZmqMessage ret_msg(mrb);
+        ret_msg.recv(owner_pair_socket);
+        mrb_value ret_str = mrb_str_new_static(mrb,
+          static_cast<const char*>(ret_msg.data()),
+          ret_msg.size()
+        );
+        return mrb_msgpack_unpack(mrb, ret_str);
+      }
+      case static_cast<uint8_t>(Opcode::OBJECT_CREATED): {
+        ZmqMessage obj_id_msg(mrb);
+        obj_id_msg.recv(owner_pair_socket);
+        if (unlikely(obj_id_msg.size() != sizeof(mrb_int))) {
+          mrb_raise(mrb, E_RUNTIME_ERROR, "Malformed OBJECT_CREATED object ID in handle_sync_calls");
+        }
+        return mrb_convert_number(mrb, *static_cast<const mrb_int*>(obj_id_msg.data()));
+      }
+      default:
+        mrb_raise(mrb, E_RUNTIME_ERROR, "Unexpected response type in handle_sync_calls");
+    }
+  }
+
+  mrb_value
+  await_response_sync(uint8_t expected_type_class, mrb_int expected_seq_num)
+  {
+    mrb_state *mrb = owner_mrb;
+    while (true) {
+      std::pair <uint8_t, bool> frame = Opcode::recv(owner_pair_socket);
+      if (frame.first == static_cast<uint8_t>(Opcode::FUTURE_VALUE) ||
+          frame.first == static_cast<uint8_t>(Opcode::FUTURE_EXCEPTION)) {
+        handle_futures(frame.first);
+      } else if (frame.first == expected_type_class) {
+        return handle_sync_calls(expected_type_class, expected_seq_num);
+      } else if (unlikely(frame.first == static_cast<uint8_t>(Opcode::RAISE_EXCEPTION))) {
+        ZmqMessage exc_msg(mrb);
+        exc_msg.recv(owner_pair_socket);
+        mrb_value exc_str = mrb_str_new_static(mrb,
+          static_cast<const char*>(exc_msg.data()),
+          exc_msg.size()
+        );
+        mrb_value exc = mrb_msgpack_unpack(mrb, exc_str);
+        mrb_exc_raise(mrb, exc);
+      } else {
+        mrb_raise(mrb, E_RUNTIME_ERROR, "Malformed response opcode in await_response_sync");
+      }
+    }
+    return mrb_undef_value(); // Unreachable
+  }
 };
 
-MRB_CPP_DEFINE_TYPE(mrb_actor_mailbox, mrb_actor_mailbox);
+MRB_CPP_DEFINE_TYPE(mrb_inproc_actor_mailbox, mrb_inproc_actor_mailbox);
 
 static mrb_value
-mrb_actor_new(mrb_state* mrb, mrb_value self)
+mrb_actor_inproc_new(mrb_state* mrb, mrb_value self)
 {
   struct RClass *actorizable_mod = mrb_module_get_id(mrb, MRB_SYM(Actorizable));
+  mrb_inproc_actor_mailbox* mailbox  = mrb_cpp_new<mrb_inproc_actor_mailbox>(mrb, self, mrb, self);
   mrb_value actor_classes = mrb_iv_get(mrb, mrb_obj_value(actorizable_mod), MRB_IVSYM(actor_classes));
-  mrb_actor_mailbox* mailbox = mrb_cpp_new<mrb_actor_mailbox>(mrb, self, mrb, actor_classes);
-  mailbox->run();
+   mailbox->run(actor_classes);
 
   return self;
 }
 
 struct mrb_actor_object {
-  mrb_actor_mailbox* mailbox;
+  mrb_inproc_actor_mailbox* mailbox;
   mrb_int object_id;
 
-  mrb_actor_object(mrb_actor_mailbox* mailbox, mrb_int object_id)
+  mrb_actor_object(mrb_inproc_actor_mailbox* mailbox, mrb_int object_id)
     : mailbox(mailbox), object_id(object_id) {}
 
   ~mrb_actor_object()
   {
-    mailbox->destroy_inproc_object(object_id);
+    mailbox->destroy_object(object_id);
   }
 };
 
@@ -683,16 +839,16 @@ MRB_CPP_DEFINE_TYPE(mrb_actor_object, mrb_actor_object);
 static mrb_value
 mrb_actor_object_initialize(mrb_state* mrb, mrb_value self)
 {
-  mrb_actor_mailbox* mailbox = nullptr;
+  mrb_inproc_actor_mailbox* mailbox = nullptr;
   mrb_int object_id = 0;
-  mrb_get_args(mrb, "di", &mailbox, &mrb_actor_mailbox_type, &object_id);
+  mrb_get_args(mrb, "di", &mailbox, &mrb_inproc_actor_mailbox_type, &object_id);
   mrb_cpp_new<mrb_actor_object>(mrb, self, mailbox, object_id);
 
   return self;
 }
 
 static mrb_value
-mrb_actor_object_call_method(mrb_state* mrb, mrb_value self)
+mrb_actor_object_send(mrb_state* mrb, mrb_value self)
 {
   mrb_actor_object* actor_obj = static_cast<mrb_actor_object*>(
     mrb_data_get_ptr(mrb, self, &mrb_actor_object_type)
@@ -704,13 +860,13 @@ mrb_actor_object_call_method(mrb_state* mrb, mrb_value self)
   mrb_value blk = mrb_nil_value();
   mrb_get_args(mrb, "n|*&", &method_id, &argv, &argc, &blk);
 
-  return actor_obj->mailbox->call_method_inproc(
+  return actor_obj->mailbox->send(
     actor_obj->object_id, method_id, argv, argc, blk
   );
 }
 
 static mrb_value
-mrb_actor_object_call_method_and_forget(mrb_state* mrb, mrb_value self)
+mrb_actor_object_send_and_forget(mrb_state* mrb, mrb_value self)
 {
   mrb_actor_object* actor_obj = static_cast<mrb_actor_object*>(
     mrb_data_get_ptr(mrb, self, &mrb_actor_object_type)
@@ -720,17 +876,17 @@ mrb_actor_object_call_method_and_forget(mrb_state* mrb, mrb_value self)
   mrb_int argc = 0;
   mrb_value blk = mrb_nil_value();
   mrb_get_args(mrb, "n|*&", &method_id, &argv, &argc, &blk);
-  actor_obj->mailbox->call_method_inproc_and_forget(
+  actor_obj->mailbox->send_and_forget(
     actor_obj->object_id, method_id, argv, argc, blk
   );
   return mrb_nil_value();
 }
 
 static mrb_value
-mrb_actor_create_inproc_object(mrb_state* mrb, mrb_value self)
+mrb_actor_inproc_create_object(mrb_state* mrb, mrb_value self)
 {
-  mrb_actor_mailbox* mailbox = static_cast<mrb_actor_mailbox*>(
-    mrb_data_get_ptr(mrb, self, &mrb_actor_mailbox_type)
+  mrb_inproc_actor_mailbox* mailbox = static_cast<mrb_inproc_actor_mailbox*>(
+    mrb_data_get_ptr(mrb, self, &mrb_inproc_actor_mailbox_type)
   );
 
   struct RClass* klass = nullptr;
@@ -739,8 +895,8 @@ mrb_actor_create_inproc_object(mrb_state* mrb, mrb_value self)
 
   mrb_get_args(mrb, "c|*", &klass, &argv, &argc);
 
-  mrb_value object_id = mailbox->create_inproc_object(klass, argv, argc);
-  return mrb_obj_new(mrb, mrb_class_get_under_id(mrb, mrb_class(mrb, self), MRB_SYM(ActorInprocObject)), 2,
+  mrb_value object_id = mailbox->create_object(klass, argv, argc);
+  return mrb_obj_new(mrb, mrb_class_get_under_id(mrb, mrb_class(mrb, self), MRB_SYM(ActorObject)), 2,
     (mrb_value[]){ self, object_id }
   );
 }
@@ -768,28 +924,27 @@ mrb_mruby_actor_gem_init(mrb_state* mrb)
   }
   mrb_value msgpack_mod = mrb_obj_value(mrb_module_get_id(mrb, MRB_SYM(MessagePack)));
 
-  /* Call: MessagePack.sym_strategy(:int) */
   mrb_funcall_id(mrb,
                 msgpack_mod,
                 MRB_SYM(sym_strategy),
                 1,
                 mrb_symbol_value(MRB_SYM(int)));
 
-  struct RClass *actor_class, *actor_inproc_object_class;
+  struct RClass *actor_class, *actor_inproc_class, *actor_object_class;
   actor_class = mrb_define_class_id(mrb, MRB_SYM(Actor), mrb->object_class);
-  mrb_define_class_id(mrb, MRB_SYM(ActorModel), mrb->object_class);
   MRB_SET_INSTANCE_TT(actor_class, MRB_TT_DATA);
-  mrb_define_method_id(mrb, actor_class, MRB_SYM(initialize), mrb_actor_new, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, actor_class, MRB_SYM(new_inproc), mrb_actor_create_inproc_object,
-    MRB_ARGS_REQ(1)|MRB_ARGS_REST());
-  actor_inproc_object_class = mrb_define_class_under_id(mrb, actor_class, MRB_SYM(ActorInprocObject), mrb->object_class);
-  MRB_SET_INSTANCE_TT(actor_inproc_object_class, MRB_TT_DATA);
-  mrb_define_method_id(mrb, actor_inproc_object_class, MRB_SYM(initialize), mrb_actor_object_initialize,
+  actor_object_class = mrb_define_class_under_id(mrb, actor_class, MRB_SYM(ActorObject), mrb->object_class);
+  MRB_SET_INSTANCE_TT(actor_object_class, MRB_TT_DATA);
+  mrb_define_method_id(mrb, actor_object_class, MRB_SYM(initialize), mrb_actor_object_initialize,
     MRB_ARGS_REQ(2));
-  mrb_define_method_id(mrb, actor_inproc_object_class, MRB_SYM(call), mrb_actor_object_call_method,
+  mrb_define_method_id(mrb, actor_object_class, MRB_SYM(send), mrb_actor_object_send,
     MRB_ARGS_REQ(1)|MRB_ARGS_BLOCK()|MRB_ARGS_REST());
-  mrb_define_method_id(mrb, actor_inproc_object_class, MRB_SYM(call_and_forget), mrb_actor_object_call_method_and_forget,
+  mrb_define_method_id(mrb, actor_object_class, MRB_SYM(send_and_forget), mrb_actor_object_send_and_forget,
     MRB_ARGS_REQ(1)|MRB_ARGS_BLOCK()|MRB_ARGS_REST());
+  actor_inproc_class = mrb_define_class_id(mrb, MRB_SYM(InprocActor), actor_class);
+  mrb_define_method_id(mrb, actor_inproc_class, MRB_SYM(initialize), mrb_actor_inproc_new, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, actor_inproc_class, MRB_SYM(new), mrb_actor_inproc_create_object,
+    MRB_ARGS_REQ(1)|MRB_ARGS_REST());
 }
 
 void
