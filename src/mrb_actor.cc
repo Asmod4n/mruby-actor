@@ -252,37 +252,17 @@ class InprocActorThreadContext
   }
 
   void
-  run_actor(mrb_value actor_classes_msg)
+  run_actor(mrb_value actor_classes_msg, mrb_bool full_vm)
   {
-    mrb = mrb_open_core();
+    if (full_vm) {
+      mrb = mrb_open();
+    } else {
+      mrb = mrb_open_core();
+      mrb_actor_register_msgpack_extensions(mrb);
+    }
     if (unlikely(!mrb)) {
       throw std::runtime_error("Failed to create mruby state in actor thread");
     }
-    mrb_msgpack_ensure(mrb);
-
-    mrb_msgpack_register_pack_type_cfunc(
-      mrb, 10, mrb->eException_class,
-      pack_exception,
-      0, NULL
-    );
-
-    mrb_msgpack_register_unpack_type_cfunc(
-      mrb, 10,
-      unpack_exception,
-      0, NULL
-    );
-
-    mrb_msgpack_register_pack_type_cfunc(
-      mrb, 12, mrb->class_class,
-      pack_class,
-      0, NULL
-    );
-
-    mrb_msgpack_register_unpack_type_cfunc(
-      mrb, 12,
-      unpack_class,
-      0, NULL
-    );
 
     pair_socket.emplace(mrb, ZMQ_PAIR);
     pair_socket->connect(endpoint.c_str());
@@ -297,14 +277,16 @@ class InprocActorThreadContext
         &env
     ));
 
-    mrb_value running = mrb_nil_value();
-    mrb_value nil = mrb_nil_value();
+    mrb_value running = mrb_true_value();
     int idx = mrb_gc_arena_save(mrb);
     Opcode::send(*pair_socket, Opcode::READY);
     do {
-      running = mrb_yield(mrb, cfunc, nil);
+      running = mrb_yield_argv(mrb, cfunc, 0, nullptr);
       mrb_gc_arena_restore(mrb, idx);
     } while (likely(mrb_true_p(running)));
+    if (!full_vm) {
+      mrb_msgpack_teardown(mrb);
+    }
 
     if (unlikely(mrb->exc)) {
       mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
@@ -355,12 +337,12 @@ class mrb_inproc_actor_mailbox
     }
   }
 
-  void run(mrb_value actor_classes)
+  void run(mrb_value actor_classes, mrb_bool full_vm)
   {
     mrb_state *mrb = owner_mrb;
     mrb_value actor_classes_msg = mrb_msgpack_pack(mrb, actor_classes);
-    thread = std::thread([this, actor_classes_msg] {
-      ctx->run_actor(actor_classes_msg);
+    thread = std::thread([this, actor_classes_msg, full_vm] {
+      ctx->run_actor(actor_classes_msg, full_vm);
     });
 
     std::pair <uint8_t, bool> frame = Opcode::recv(owner_pair_socket);
@@ -386,7 +368,7 @@ class mrb_inproc_actor_mailbox
 
     mrb_sym class_id = mrb_symbol(path);
     ZmqMessage class_id_msg(mrb, &class_id, sizeof(class_id));
-    class_id_msg.send(owner_pair_socket, argc ? ZMQ_SNDMORE : 0);
+    class_id_msg.send(owner_pair_socket, argc > 0 ? ZMQ_SNDMORE : 0);
 
     // Optional args frame
     if (argc > 0) {
@@ -615,16 +597,48 @@ static mrb_value
 mrb_actor_inproc_new(mrb_state* mrb, mrb_value self)
 {
 #ifdef MRB_NO_PRESYM
-  mrb_raise(mrb, E_RUNTIME_ERROR, "mruby/presym is required for mruby-actor inproc actors");
+  mrb_raise(mrb, E_RUNTIME_ERROR,
+            "mruby/presym is required for mruby-actor inproc actors");
 #else
-  struct RClass *actorizable_mod = mrb_module_get_id(mrb, MRB_SYM(Actorizable));
-  mrb_inproc_actor_mailbox* mailbox  = mrb_cpp_new<mrb_inproc_actor_mailbox>(mrb, self, mrb, self);
-  mrb_value actor_classes = mrb_iv_get(mrb, mrb_obj_value(actorizable_mod), MRB_IVSYM(actor_classes));
-  mailbox->run(actor_classes);
+  // --- keyword argument setup ---
+  mrb_sym kw_names[] = { MRB_SYM(full_vm) };
+  mrb_value kw_values[1];
+  mrb_kwargs kwargs = {
+    1,      // num keywords
+    0,      // required keywords
+    kw_names,
+    kw_values,
+    NULL    // no **rest allowed
+  };
+
+  // Parse only keyword args
+  mrb_get_args(mrb, ":", &kwargs);
+
+  // Default
+  mrb_bool full_vm = FALSE;
+
+  // If provided, override
+  if (!mrb_undef_p(kw_values[0])) {
+    full_vm = mrb_test(kw_values[0]);
+  }
+
+  struct RClass *actorizable_mod =
+      mrb_module_get_id(mrb, MRB_SYM(Actorizable));
+
+  mrb_inproc_actor_mailbox* mailbox =
+      mrb_cpp_new<mrb_inproc_actor_mailbox>(mrb, self, mrb, self);
+
+  mrb_value actor_classes =
+      mrb_iv_get(mrb, mrb_obj_value(actorizable_mod),
+                 MRB_IVSYM(actor_classes));
+
+  mailbox->run(actor_classes, full_vm);
 #endif
 
   return self;
 }
+
+
 
 struct mrb_actor_object {
   mrb_inproc_actor_mailbox* mailbox;
@@ -727,13 +741,6 @@ mrb_mruby_actor_gem_init(mrb_state* mrb)
   if (unlikely(!mrb_actor_zmq_context)) {
     mrb_sys_fail(mrb, "Failed to create ZMQ context");
   }
-  mrb_value msgpack_mod = mrb_obj_value(mrb_module_get_id(mrb, MRB_SYM(MessagePack)));
-
-  mrb_funcall_id(mrb,
-                msgpack_mod,
-                MRB_SYM(sym_strategy),
-                1,
-                mrb_symbol_value(MRB_SYM(int)));
 
   struct RClass *actor_class, *actor_inproc_class, *actor_object_class;
   actor_class = mrb_define_class_id(mrb, MRB_SYM(Actor), mrb->object_class);
@@ -747,9 +754,11 @@ mrb_mruby_actor_gem_init(mrb_state* mrb)
   mrb_define_method_id(mrb, actor_object_class, MRB_SYM(send_and_forget), mrb_actor_object_send_and_forget,
     MRB_ARGS_REQ(1)|MRB_ARGS_BLOCK()|MRB_ARGS_REST());
   actor_inproc_class = mrb_define_class_id(mrb, MRB_SYM(InprocActor), actor_class);
-  mrb_define_method_id(mrb, actor_inproc_class, MRB_SYM(initialize), mrb_actor_inproc_new, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, actor_inproc_class, MRB_SYM(initialize), mrb_actor_inproc_new, MRB_ARGS_KEY(1, 0));
   mrb_define_method_id(mrb, actor_inproc_class, MRB_SYM(new), mrb_actor_inproc_create_object,
     MRB_ARGS_REQ(1)|MRB_ARGS_REST());
+
+  mrb_actor_register_msgpack_extensions(mrb);
 }
 
 void
