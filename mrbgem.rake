@@ -10,6 +10,6 @@ MRuby::Gem::Specification.new('mruby-actor') do |spec|
   spec.add_dependency 'mruby-errno'
   spec.add_dependency 'mruby-error'
   spec.add_dependency 'mruby-c-ext-helpers'
-  spec.add_dependency 'mruby-simplemsgpack', '>= 4.0.0'
+  spec.add_dependency 'mruby-simplemsgpack', '>= 4.0.1'
   spec.add_dependency 'mruby-zmq', '>= 1.0.0'
 end

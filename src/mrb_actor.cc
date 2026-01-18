@@ -1,247 +1,28 @@
-#include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <iostream>
-#include <mruby.h>
-#include <mruby/presym.h>
-#include <stdexcept>
-#include <thread>
-#define ZMQ_BUILD_DRAFT_API
-#include <zmq.h>
-#include <mutex>
-#include <mruby/cpp_helpers.hpp>
-#include <mruby/class.h>
-#include <mruby/data.h>
-#include <sstream>
 #define MSGPACK_NO_BOOST
 #define MSGPACK_DEFAULT_API_VERSION 3
 #include <msgpack.hpp>
-#include <mruby/msgpack.h>
-#include <exception>
-#include <mruby/string.h>
+#include "base_virtual_actor_context.hpp"
+#include "base_virtual_actor_mailbox.hpp"
+#include "mrb_actor_zmq.hpp"
+#include "opcodes.hpp"
 #include <mruby/branch_pred.h>
-#include <mruby/error.h>
+#include <mruby/msgpack.h>
 #include <mruby/array.h>
-MRB_BEGIN_DECL
-#include <mruby/internal.h>
-MRB_END_DECL
-#include <mruby/hash.h>
+#include <mruby/error.h>
+#include <mruby/string.h>
+#include <mruby/presym.h>
 #include <mruby/variable.h>
 #include <mruby/num_helpers.hpp>
-#include <mruby/zmq.h>
+#include <mruby/hash.h>
 #include <mruby/proc.h>
 #include <mruby/class.h>
-#include <chrono>
-
-static void *mrb_actor_zmq_context = nullptr;
-static std::once_flag zmq_context_once;
-
-struct ZmqSocket
-{
-  mrb_state *mrb;
-
-  explicit ZmqSocket(mrb_state *mrb, int type) : mrb(mrb)
-  {
-    socket_ = zmq_socket(mrb_actor_zmq_context, type);
-    if (unlikely(!socket_)) {
-      errno = zmq_errno();
-      mrb_sys_fail(mrb, "Failed to create ZMQ socket");
-    }
-  }
-
-  // Non-copyable
-  ZmqSocket(const ZmqSocket&) = delete;
-  ZmqSocket& operator=(const ZmqSocket&) = delete;
-
-  // Non-movable
-  ZmqSocket(ZmqSocket&&) = delete;
-  ZmqSocket& operator=(ZmqSocket&&) = delete;
-
-  ~ZmqSocket()
-  {
-    if (likely(socket_)) {
-      zmq_close(socket_);
-      socket_ = nullptr;
-    }
-  }
-
-  void
-  bind(const char* endpoint)
-  {
-    if (unlikely(zmq_bind(socket_, endpoint) != 0)) {
-      errno = zmq_errno();
-      mrb_sys_fail(mrb, "Failed to bind ZMQ socket");
-    }
-  }
-
-  void
-  connect(const char* endpoint)
-  {
-    if (unlikely(zmq_connect(socket_, endpoint) != 0)) {
-      errno = zmq_errno();
-      mrb_sys_fail(mrb, "Failed to connect ZMQ socket");
-    }
-  }
-
-  void*
-  raw() const noexcept
-  {
-    return socket_;
-  }
-
-private:
-  void* socket_ = nullptr;
-};
-
-struct ZmqMessage
-{
-  ZmqMessage(mrb_state *mrb) : mrb(mrb)
-  {
-    if (unlikely(zmq_msg_init(&_msg) != 0)) {
-      errno = zmq_errno();
-      mrb_sys_fail(mrb, "Failed to initialize ZMQ message");
-    }
-  }
-
-  explicit ZmqMessage(mrb_state *mrb, const void *string, size_t size) : mrb(mrb)
-  {
-    if (unlikely(zmq_msg_init_size(&_msg, size) != 0)) {
-      errno = zmq_errno();
-      mrb_sys_fail(mrb, "Failed to initialize ZMQ message with size");
-    }
-    std::memcpy(zmq_msg_data(&_msg), string, size);
-  }
-
-  ~ZmqMessage()
-  {
-    zmq_msg_close(&_msg);
-  }
-
-  ZmqMessage(const ZmqMessage&) = delete;
-  ZmqMessage& operator=(const ZmqMessage&) = delete;
-  ZmqMessage(ZmqMessage&&) = delete;
-  ZmqMessage& operator=(ZmqMessage&&) = delete;
-
-  size_t size() const
-  {
-    return zmq_msg_size(const_cast<zmq_msg_t*>(&_msg));
-  }
-
-  const void* data() const
-  {
-    return zmq_msg_data(const_cast<zmq_msg_t*>(&_msg));
-  }
-
-  void* data()
-  {
-    return zmq_msg_data(&_msg);
-  }
-
-  bool more() const
-  {
-    return zmq_msg_more(const_cast<zmq_msg_t*>(&_msg)) != 0;
-  }
-
-  int
-  recv(ZmqSocket &socket, int flags = 0)
-  {
-      int rc = zmq_msg_recv(&_msg, socket.raw(), flags);
-
-      if (rc == -1) {
-          errno = zmq_errno();
-
-          // Non-blocking receive: no message available
-          if ((flags & ZMQ_DONTWAIT) && errno == EAGAIN) {
-              return -1; // caller interprets as "no message"
-          }
-
-          // Real error
-          mrb_sys_fail(mrb, "Failed to receive ZMQ message");
-      }
-
-      return rc;
-  }
-
-  int
-  send(ZmqSocket &socket, int flags = 0)
-  {
-    int rc = zmq_msg_send(&_msg, socket.raw(), flags);
-    if (unlikely(rc == -1)) {
-      errno = zmq_errno();
-      mrb_sys_fail(mrb, "Failed to send ZMQ message");
-    }
-    return rc;
-  }
-
-  private:
-  mrb_state *mrb;
-  zmq_msg_t _msg;
-};
-
-struct Opcode
-{
-  enum : uint8_t
-  {
-    READY                  = 0,
-    SHUTDOWN               = 1,
-
-    CREATE_OBJECT          = 20,
-    DESTROY_OBJECT         = 21,
-    OBJECT_CREATED         = 22,
-
-    CALL_METHOD            = 40,
-    CALL_METHOD_AND_FORGET = 41,
-    RETURN_VALUE           = 42,
-    RAISE_EXCEPTION        = 43,
-
-    CALL_FUTURE            = 60,
-    FUTURE_VALUE           = 61,
-    FUTURE_EXCEPTION       = 62,
-
-    TIMEOUT                = 100,
-
-    MALFORMED_OPCODE       = 255
-  };
-
-  static int
-  send(ZmqSocket &socket, uint8_t op, int flags = 0)
-  {
-    ZmqMessage m(socket.mrb, &op, sizeof(op));
-    return m.send(socket, flags);
-  }
-
-  static std::pair<uint8_t, bool>
-  recv(ZmqSocket &socket, int flags = 0)
-  {
-      ZmqMessage msg(socket.mrb);
-      int rc = msg.recv(socket, flags);
-
-      if (rc == -1) {
-          errno = zmq_errno();
-
-          // Non-blocking: no message available
-          if ((flags & ZMQ_DONTWAIT) && errno == EAGAIN) {
-              return {static_cast<uint8_t>(TIMEOUT), false};
-          }
-
-          // Real error → propagate
-          mrb_sys_fail(socket.mrb, "Failed to receive ZMQ message");
-      }
-
-      // Normal path
-      if (unlikely(msg.size() != sizeof(uint8_t))) {
-          return {static_cast<uint8_t>(MALFORMED_OPCODE), msg.more()};
-      }
-
-      const uint8_t byte =
-          *static_cast<const uint8_t*>(msg.data());
-
-      return {byte, msg.more()};
-  }
-};
+#include <thread>
+#include <mruby/zmq.h>
+#include "util.hpp"
 
 class InprocActorThreadContext
 {
+  protected:
   std::string endpoint;
   std::optional<ZmqSocket> pair_socket;
   mrb_value actor_classes = mrb_undef_value();
@@ -473,19 +254,35 @@ class InprocActorThreadContext
   void
   run_actor(mrb_value actor_classes_msg)
   {
-    mrb = mrb_open();
+    mrb = mrb_open_core();
     if (unlikely(!mrb)) {
       throw std::runtime_error("Failed to create mruby state in actor thread");
     }
-    actor_classes = mrb_msgpack_unpack(mrb, actor_classes_msg);
-    mrb_zmq_set_context(mrb, mrb_actor_zmq_context);
-    mrb_value msgpack_mod = mrb_obj_value(mrb_module_get_id(mrb, MRB_SYM(MessagePack)));
+    mrb_msgpack_ensure(mrb);
 
-    mrb_funcall_id(mrb,
-                  msgpack_mod,
-                  MRB_SYM(sym_strategy),
-                  1,
-                  mrb_symbol_value(MRB_SYM(int)));
+    mrb_msgpack_register_pack_type_cfunc(
+      mrb, 10, mrb->eException_class,
+      pack_exception,
+      0, NULL
+    );
+
+    mrb_msgpack_register_unpack_type_cfunc(
+      mrb, 10,
+      unpack_exception,
+      0, NULL
+    );
+
+    mrb_msgpack_register_pack_type_cfunc(
+      mrb, 12, mrb->class_class,
+      pack_class,
+      0, NULL
+    );
+
+    mrb_msgpack_register_unpack_type_cfunc(
+      mrb, 12,
+      unpack_class,
+      0, NULL
+    );
 
     pair_socket.emplace(mrb, ZMQ_PAIR);
     pair_socket->connect(endpoint.c_str());
@@ -500,7 +297,7 @@ class InprocActorThreadContext
         &env
     ));
 
-    mrb_value running;
+    mrb_value running = mrb_nil_value();
     mrb_value nil = mrb_nil_value();
     int idx = mrb_gc_arena_save(mrb);
     Opcode::send(*pair_socket, Opcode::READY);
@@ -515,10 +312,9 @@ class InprocActorThreadContext
   }
 };
 
-
-
 class mrb_inproc_actor_mailbox
 {
+  protected:
   mrb_state *owner_mrb = nullptr;
   mrb_value self;
   std::thread thread;
@@ -558,12 +354,6 @@ class mrb_inproc_actor_mailbox
       thread.join();
     }
   }
-
-  mrb_inproc_actor_mailbox(const mrb_inproc_actor_mailbox&) = delete;
-  mrb_inproc_actor_mailbox& operator=(const mrb_inproc_actor_mailbox&) = delete;
-
-  mrb_inproc_actor_mailbox(mrb_inproc_actor_mailbox&&) = delete;
-  mrb_inproc_actor_mailbox& operator=(mrb_inproc_actor_mailbox&&) = delete;
 
   void run(mrb_value actor_classes)
   {
@@ -792,6 +582,17 @@ class mrb_inproc_actor_mailbox
       } else if (frame.first == expected_type_class) {
         return handle_sync_calls(expected_type_class, expected_seq_num);
       } else if (unlikely(frame.first == static_cast<uint8_t>(Opcode::RAISE_EXCEPTION))) {
+        ZmqMessage seq_msg(mrb);
+        int rc = seq_msg.recv(owner_pair_socket);
+        if (unlikely(rc != sizeof(mrb_int))) {
+          mrb_raise(mrb, E_RUNTIME_ERROR, "Malformed sequence number in response");
+        }
+        mrb_int resp_seq_num =
+          *static_cast<const mrb_int*>(seq_msg.data());
+        if (unlikely(resp_seq_num != expected_seq_num)) {
+          mrb_raise(mrb, E_RUNTIME_ERROR, "Mismatched sequence number in response");
+        }
+
         ZmqMessage exc_msg(mrb);
         exc_msg.recv(owner_pair_socket);
         mrb_value exc_str = mrb_str_new_static(mrb,
@@ -813,10 +614,14 @@ MRB_CPP_DEFINE_TYPE(mrb_inproc_actor_mailbox, mrb_inproc_actor_mailbox);
 static mrb_value
 mrb_actor_inproc_new(mrb_state* mrb, mrb_value self)
 {
+#ifdef MRB_NO_PRESYM
+  mrb_raise(mrb, E_RUNTIME_ERROR, "mruby/presym is required for mruby-actor inproc actors");
+#else
   struct RClass *actorizable_mod = mrb_module_get_id(mrb, MRB_SYM(Actorizable));
   mrb_inproc_actor_mailbox* mailbox  = mrb_cpp_new<mrb_inproc_actor_mailbox>(mrb, self, mrb, self);
   mrb_value actor_classes = mrb_iv_get(mrb, mrb_obj_value(actorizable_mod), MRB_IVSYM(actor_classes));
-   mailbox->run(actor_classes);
+  mailbox->run(actor_classes);
+#endif
 
   return self;
 }
