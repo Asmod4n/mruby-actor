@@ -1,5 +1,6 @@
 #pragma once
 #include <mruby.h>
+#include <mruby/proc.h>
 #include <mruby/array.h>
 #include <mruby/class.h>
 #include <mruby/presym.h>
@@ -89,8 +90,9 @@ unpack_proc(mrb_state *mrb, mrb_value self)
 {
   mrb_value irep;
   mrb_get_args(mrb, "S", &irep);
+  mrb_str_modify(mrb, mrb_str_ptr(irep));
 
-  return mrb_proc_from_irep(mrb, RSTRING(irep), RSTRING_LEN(irep));
+  return mrb_proc_from_irep(mrb, RSTRING_PTR(irep), RSTRING_LEN(irep));
 }
 
 static mrb_value

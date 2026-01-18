@@ -24,19 +24,23 @@ class InprocActorThreadContext
 {
   protected:
   std::string endpoint;
+  mrb_bool full_vm = FALSE;
   std::optional<ZmqSocket> pair_socket;
-  mrb_value actor_classes = mrb_undef_value();
   mrb_state *mrb = nullptr;
 
   public:
 
-  InprocActorThreadContext(const std::string& addr) : endpoint(addr)
+  InprocActorThreadContext(const std::string& endpoint, mrb_bool full_vm) : endpoint(endpoint), full_vm(full_vm)
   {
   }
 
   ~InprocActorThreadContext()
   {
     if (mrb) {
+      if (!full_vm) {
+        mrb_msgpack_teardown(mrb);
+      }
+
       mrb_close(mrb);
       mrb = nullptr;
     }
@@ -46,7 +50,7 @@ class InprocActorThreadContext
   {
     ZmqMessage seq_msg(mrb);
     int rc = seq_msg.recv(*pair_socket);
-    if (unlikely(rc != sizeof(uint64_t))) {
+    if (unlikely(rc != sizeof(mrb_int))) {
       mrb_raise(mrb, E_ARGUMENT_ERROR, "Malformed sequence number in CREATE_OBJECT");
     }
 
@@ -124,39 +128,63 @@ class InprocActorThreadContext
 
     mrb_value arg_value = mrb_nil_value();
     mrb_value blk_value = mrb_nil_value();
-
-    // Check if args frame exists
-    if (func_msg.more()) {
-      ZmqMessage args_msg(mrb);
-      args_msg.recv(*pair_socket);
-      mrb_value args_str = mrb_str_new_static(mrb,
-        static_cast<const char*>(args_msg.data()),
-        args_msg.size()
+    // No args, no block
+    if (!func_msg.more()) {
+      return mrb_funcall_with_block(
+        mrb, target_obj, method_id,
+        0, nullptr,
+        blk_value
       );
-      arg_value = mrb_msgpack_unpack(mrb, args_str);
-      if (args_msg.more()) {
+    }
+
+    // --- First optional frame ---
+    ZmqMessage first_msg(mrb);
+    first_msg.recv(*pair_socket);
+
+    mrb_value first_str = mrb_str_new_static(
+      mrb,
+      static_cast<const char*>(first_msg.data()),
+      first_msg.size()
+    );
+    mrb_value first_val = mrb_msgpack_unpack(mrb, first_str);
+
+    if (mrb_array_p(first_val)) {
+      // This is args
+      arg_value = first_val;
+
+      if (first_msg.more()) {
+        // Block follows
         ZmqMessage blk_msg(mrb);
         blk_msg.recv(*pair_socket);
 
-        mrb_value blk_str = mrb_str_new_static(mrb,
+        mrb_value blk_str = mrb_str_new_static(
+          mrb,
           static_cast<const char*>(blk_msg.data()),
           blk_msg.size()
         );
         blk_value = mrb_msgpack_unpack(mrb, blk_str);
-        // After reading block frame (if present)
+
         if (blk_msg.more()) {
-            // Protocol violation: unexpected extra frames
-            // In inproc mode, safest action is to abort
-            mrb_raise(mrb, E_RUNTIME_ERROR, "Malformed message: unexpected extra frames");
+          mrb_raise(mrb, E_RUNTIME_ERROR, "Malformed message: unexpected extra frames");
         }
+      }
+
+    } else {
+      // This is block, no args
+      blk_value = first_val;
+
+      if (first_msg.more()) {
+        mrb_raise(mrb, E_RUNTIME_ERROR, "Malformed message: unexpected extra frames");
       }
     }
 
-    return mrb_funcall_with_block(mrb, target_obj, method_id,
-        mrb_array_p(arg_value) ? RARRAY_LEN(arg_value) : 0,
-        mrb_array_p(arg_value) ? RARRAY_PTR(arg_value) : nullptr,
-        blk_value
-      );
+    return mrb_funcall_with_block(
+      mrb, target_obj, method_id,
+      mrb_array_p(arg_value) ? RARRAY_LEN(arg_value) : 0,
+      mrb_array_p(arg_value) ? RARRAY_PTR(arg_value) : nullptr,
+      blk_value
+    );
+
   }
 
   void handle_opcode_call_future()
@@ -189,7 +217,7 @@ class InprocActorThreadContext
   {
     ZmqMessage seq_msg(mrb);
     int rc = seq_msg.recv(*pair_socket);
-    if (unlikely(rc != sizeof(uint64_t))) {
+    if (unlikely(rc != sizeof(mrb_int))) {
       mrb_raise(mrb, E_ARGUMENT_ERROR, "Malformed sequence number in CALL_METHOD_AND_FORGET");
     }
 
@@ -246,13 +274,17 @@ class InprocActorThreadContext
     } else if (frame.first == static_cast<uint8_t>(Opcode::DESTROY_OBJECT)) {
       ctx->handle_opcode_destroy_object();
     } else {
-      mrb_raise(mrb, E_RUNTIME_ERROR, "Unknown opcode in mrb_actor_step");
+      mrb_raisef(mrb, E_RUNTIME_ERROR, "Unknown opcode in mrb_actor_step %S", mrb_fixnum_value(frame.first));
+    }
+    if(mrb->exc) {
+      mrb_print_error(mrb);
+      mrb_clear_error(mrb);
     }
     return mrb_true_value();
   }
 
   void
-  run_actor(mrb_value actor_classes_msg, mrb_bool full_vm)
+  run_actor(mrb_value actor_classes_msg_)
   {
     if (full_vm) {
       mrb = mrb_open();
@@ -263,6 +295,9 @@ class InprocActorThreadContext
     if (unlikely(!mrb)) {
       throw std::runtime_error("Failed to create mruby state in actor thread");
     }
+
+    mrb_value actor_classes = mrb_msgpack_unpack(mrb, actor_classes_msg_);
+    mrb_gv_set(mrb, MRB_SYM(__actor_classes__), actor_classes);
 
     pair_socket.emplace(mrb, ZMQ_PAIR);
     pair_socket->connect(endpoint.c_str());
@@ -284,9 +319,7 @@ class InprocActorThreadContext
       running = mrb_yield_argv(mrb, cfunc, 0, nullptr);
       mrb_gc_arena_restore(mrb, idx);
     } while (likely(mrb_true_p(running)));
-    if (!full_vm) {
-      mrb_msgpack_teardown(mrb);
-    }
+
 
     if (unlikely(mrb->exc)) {
       mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
@@ -316,7 +349,7 @@ class mrb_inproc_actor_mailbox
 
   public:
 
-  mrb_inproc_actor_mailbox(mrb_state *owner_mrb, mrb_value self) : owner_mrb(owner_mrb), self(self), owner_pair_socket(owner_mrb, ZMQ_PAIR)
+  mrb_inproc_actor_mailbox(mrb_state *owner_mrb, mrb_value self, mrb_bool full_vm) : owner_mrb(owner_mrb), self(self), owner_pair_socket(owner_mrb, ZMQ_PAIR)
   {
     mrb_state *mrb = owner_mrb;
     pair_endpoint = make_mailbox_pair_endpoint();
@@ -326,7 +359,7 @@ class mrb_inproc_actor_mailbox
     mrb_iv_set(mrb, self, MRB_SYM(__future_answers__), future_answers);
 
     // Create actor thread context
-    ctx.emplace(pair_endpoint);
+    ctx.emplace(pair_endpoint, full_vm);
   }
 
   ~mrb_inproc_actor_mailbox()
@@ -337,12 +370,12 @@ class mrb_inproc_actor_mailbox
     }
   }
 
-  void run(mrb_value actor_classes, mrb_bool full_vm)
+  void run(mrb_value actor_classes)
   {
     mrb_state *mrb = owner_mrb;
     mrb_value actor_classes_msg = mrb_msgpack_pack(mrb, actor_classes);
-    thread = std::thread([this, actor_classes_msg, full_vm] {
-      ctx->run_actor(actor_classes_msg, full_vm);
+    thread = std::thread([this, actor_classes_msg] {
+      ctx->run_actor(actor_classes_msg);
     });
 
     std::pair <uint8_t, bool> frame = Opcode::recv(owner_pair_socket);
@@ -395,7 +428,8 @@ class mrb_inproc_actor_mailbox
     obj_id_msg.send(owner_pair_socket, ZMQ_SNDMORE);
 
     ZmqMessage method_id_msg(mrb, &method_id, sizeof(method_id));
-    method_id_msg.send(owner_pair_socket, argc > 0 ? ZMQ_SNDMORE : 0);
+    int more = (argc > 0 || mrb_proc_p(blk)) ? ZMQ_SNDMORE : 0;
+    method_id_msg.send(owner_pair_socket, more);
 
     if (argc > 0) {
       mrb_value packed_args = mrb_msgpack_pack_argv(mrb, argv, argc);
@@ -425,7 +459,8 @@ class mrb_inproc_actor_mailbox
     obj_id_msg.send(owner_pair_socket, ZMQ_SNDMORE);
 
     ZmqMessage method_id_msg(mrb, &method_id, sizeof(method_id));
-    method_id_msg.send(owner_pair_socket, argc > 0 ? ZMQ_SNDMORE : 0);
+    int more = (argc > 0 || mrb_proc_p(blk)) ? ZMQ_SNDMORE : 0;
+    method_id_msg.send(owner_pair_socket, more);
 
     if (argc > 0) {
       mrb_value packed_args = mrb_msgpack_pack_argv(mrb, argv, argc);
@@ -438,7 +473,6 @@ class mrb_inproc_actor_mailbox
       ZmqMessage blk_msg(mrb, RSTRING_PTR(packed_blk), RSTRING_LEN(packed_blk));
       blk_msg.send(owner_pair_socket);
     }
-
   }
 
   void
@@ -550,6 +584,8 @@ class mrb_inproc_actor_mailbox
       default:
         mrb_raise(mrb, E_RUNTIME_ERROR, "Unexpected response type in handle_sync_calls");
     }
+
+    return mrb_undef_value();
   }
 
   mrb_value
@@ -602,7 +638,7 @@ mrb_actor_inproc_new(mrb_state* mrb, mrb_value self)
 #else
   // --- keyword argument setup ---
   mrb_sym kw_names[] = { MRB_SYM(full_vm) };
-  mrb_value kw_values[1];
+  mrb_value kw_values[] = { mrb_undef_value() };
   mrb_kwargs kwargs = {
     1,      // num keywords
     0,      // required keywords
@@ -626,19 +662,17 @@ mrb_actor_inproc_new(mrb_state* mrb, mrb_value self)
       mrb_module_get_id(mrb, MRB_SYM(Actorizable));
 
   mrb_inproc_actor_mailbox* mailbox =
-      mrb_cpp_new<mrb_inproc_actor_mailbox>(mrb, self, mrb, self);
+      mrb_cpp_new<mrb_inproc_actor_mailbox>(mrb, self, mrb, self, full_vm);
 
   mrb_value actor_classes =
       mrb_iv_get(mrb, mrb_obj_value(actorizable_mod),
                  MRB_IVSYM(actor_classes));
 
-  mailbox->run(actor_classes, full_vm);
+  mailbox->run(actor_classes);
 #endif
 
   return self;
 }
-
-
 
 struct mrb_actor_object {
   mrb_inproc_actor_mailbox* mailbox;
@@ -695,6 +729,7 @@ mrb_actor_object_send_and_forget(mrb_state* mrb, mrb_value self)
   mrb_int argc = 0;
   mrb_value blk = mrb_nil_value();
   mrb_get_args(mrb, "n|*&", &method_id, &argv, &argc, &blk);
+
   actor_obj->mailbox->send_and_forget(
     actor_obj->object_id, method_id, argv, argc, blk
   );
