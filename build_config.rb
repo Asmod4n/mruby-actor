@@ -2,6 +2,8 @@ MRuby::Build.new do |conf|
   toolchain :gcc
   enable_debug
   conf.enable_sanitizer "address,undefined"
+  conf.cc.defines  << 'MRB_UTF8_STRING'
+  conf.cxx.defines << 'MRB_UTF8_STRING'
   conf.cxx.flags << '-fno-omit-frame-pointer'
   conf.linker.flags_before_libraries << '-static-libasan'
   #conf.cxx.flags << '-O3' << '-march=native' << '-std=c++23'
