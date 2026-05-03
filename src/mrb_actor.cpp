@@ -12,12 +12,12 @@
 #include <mruby/value.h>
 #include <mruby/variable.h>
 
-#include <condition_variable>
+#include "mpsc_mailbox.hpp"
+
+#include <atomic>
 #include <cstdint>
-#include <deque>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -43,55 +43,72 @@ struct Reply {
 };
 
 struct Envelope {
-  Op                                 op = Op::SHUTDOWN;
-  std::string                        payload;
+  Op                                   op = Op::SHUTDOWN;
+  std::string                          payload;
   std::shared_ptr<std::promise<Reply>> reply;
 };
 
+// Mailbox: lock-free MPSC queue of Envelopes plus a tiny shutdown
+// handshake. The fast path (push/pop) never grabs a lock — producers
+// race only on a single atomic exchange and notify via std::atomic::wait.
+//
+// Shutdown is coordinated with an atomic `closed_` flag and an `inflight_`
+// counter (Dekker-style with seq_cst on the critical pair). Once
+// close_and_drain() returns, every push that has not yet incremented
+// `inflight_` is guaranteed to short-circuit with the canned reply, and
+// every push already past that point has been observed and either
+// enqueued (then drained) or skipped.
 class Mailbox {
 public:
   void push(Envelope env) {
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      if (closed_) {
-        if (env.reply) {
-          Reply r;
-          r.kind    = ReplyKind::EXCEPTION;
-          r.payload = closed_exception_payload_;
-          env.reply->set_value(std::move(r));
-        }
-        return;
-      }
-      q_.push_back(std::move(env));
+    inflight_.fetch_add(1, std::memory_order_seq_cst);
+    if (closed_.load(std::memory_order_seq_cst)) {
+      inflight_.fetch_sub(1, std::memory_order_release);
+      reply_canned(env);
+      return;
     }
-    cv_.notify_one();
+    queue_.push(std::move(env));
+    inflight_.fetch_sub(1, std::memory_order_release);
   }
 
-  Envelope pop() {
-    std::unique_lock<std::mutex> lk(mu_);
-    cv_.wait(lk, [&] { return !q_.empty(); });
-    Envelope e = std::move(q_.front());
-    q_.pop_front();
-    return e;
+  Envelope pop() { return queue_.pop_blocking(); }
+
+  bool closed() const {
+    return closed_.load(std::memory_order_acquire);
   }
 
-  void close(std::string canned_exception_payload) {
-    std::lock_guard<std::mutex> lk(mu_);
-    closed_                    = true;
-    closed_exception_payload_  = std::move(canned_exception_payload);
-  }
-
-  bool closed() {
-    std::lock_guard<std::mutex> lk(mu_);
-    return closed_;
+  // Called by the actor thread (single producer of the close event)
+  // *after* it has exited its own loop. Synchronises with all in-flight
+  // pushers, then drains anything still in the queue, replying with the
+  // canned exception so no caller ever blocks on a future forever.
+  void close_and_drain(std::string canned_exception_payload) {
+    canned_payload_ = std::move(canned_exception_payload);
+    closed_.store(true, std::memory_order_seq_cst);
+    while (inflight_.load(std::memory_order_seq_cst) > 0) {
+      std::this_thread::yield();
+    }
+    Envelope e;
+    while (queue_.try_pop(e)) {
+      reply_canned(e);
+    }
+    // Wake any consumers parked in pop() so they can observe shutdown.
+    queue_.wake_all();
   }
 
 private:
-  std::mutex                  mu_;
-  std::condition_variable     cv_;
-  std::deque<Envelope>        q_;
-  bool                        closed_ = false;
-  std::string                 closed_exception_payload_;
+  void reply_canned(Envelope& env) {
+    if (env.reply) {
+      Reply r;
+      r.kind    = ReplyKind::EXCEPTION;
+      r.payload = canned_payload_;
+      env.reply->set_value(std::move(r));
+    }
+  }
+
+  MpscQueue<Envelope>   queue_;
+  std::atomic<bool>     closed_{false};
+  std::atomic<uint32_t> inflight_{0};
+  std::string           canned_payload_;
 };
 
 // ---------- Actor-thread side ----------
@@ -254,7 +271,7 @@ static void run_actor(std::shared_ptr<Mailbox> mb,
   mrb_state* mrb = mrb_open();
   if (!mrb) {
     ready->set_value(false);
-    mb->close({});
+    mb->close_and_drain({});
     return;
   }
   ready->set_value(true);
@@ -312,7 +329,7 @@ static void run_actor(std::shared_ptr<Mailbox> mb,
   mrb_ary_push(mrb, canned_ary, mrb_nil_value());
   std::string canned = encode_value(mrb, canned_ary);
 
-  mb->close(std::move(canned));
+  mb->close_and_drain(std::move(canned));
   mrb_close(mrb);
 }
 

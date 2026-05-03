@@ -13,6 +13,8 @@ MRuby::Gem::Specification.new('mruby-actor') do |spec|
   spec.add_dependency 'mruby-cbor', github: 'Asmod4n/mruby-cbor', branch: 'main'
   spec.add_dependency 'mruby-str-constantize', github: 'Asmod4n/mruby-str-constantize', branch: 'main'
 
-  spec.cxx.flags << '-std=c++17' << '-pthread'
+  # Need C++20 for std::atomic<T>::wait / notify_one used by the
+  # lock-free MPSC mailbox.
+  spec.cxx.flags << '-std=c++20' << '-pthread'
   spec.linker.flags << '-pthread'
 end
